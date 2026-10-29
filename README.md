@@ -46,12 +46,19 @@ holds ids, not events, so requests do not re-query the store.
 to; the query string is forwarded), `headers` (sent upstream), `timeout_secs`, and optionally `resolve_nip05` (a URL
 template with `{name}`) plus `resolve_headers`. With `resolve_nip05`, a segment that is not a 64 char hex pubkey is looked up
 as a nostr address first and the pubkey is substituted, falling back to the raw segment. Only GET, HEAD and OPTIONS are
-served; responses get `access-control-allow-origin: *` and `cache-control: no-store`. Example (zap.stream lnurlp):
+served; responses get `access-control-allow-origin: *` and `cache-control: no-store`. `forward_path: true` appends the request path (not just the remainder) to `upstream`, and `{host}` in any header value is replaced with the request host (`x-forwarded-host` first, port stripped). Example (zap.stream lnurlp):
 
 ```json
 {"prefix": "/.well-known/lnurlp/", "upstream": "https://api-core.zap.stream/.well-known/lnurlp/",
  "resolve_nip05": "https://api.snort.social/.well-known/nostr.json?name={name}",
  "resolve_headers": {"X-Proxy-Host": "zap.stream"}}
+```
+
+snort.social (the `snort-social-nip05` worker, same rule for `/.well-known/lnurlp/` if it is routed there):
+
+```json
+{"prefix": "/.well-known/nostr.json", "upstream": "https://api.snort.social", "forward_path": true,
+ "headers": {"X-Proxy-Host": "{host}"}}
 ```
 
 Routes: pages, `/sitemap.xml`, `/sitemap-pages.xml`, `/sitemap-NAME-N.xml`, static client assets.

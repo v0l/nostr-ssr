@@ -46,12 +46,21 @@ fn is_pubkey(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-async fn resolve(client: &Client, rule: &ProxyRule, name: &str) -> Option<String> {
+fn request_host(headers: &HeaderMap) -> String {
+    let raw = headers.get("x-forwarded-host").or_else(|| headers.get(header::HOST)).and_then(|h| h.to_str().ok()).unwrap_or("");
+    raw.split(',').next().unwrap_or("").trim().split(':').next().unwrap_or("").to_string()
+}
+
+fn with_host(value: &str, host: &str) -> String {
+    value.replace("{host}", host)
+}
+
+async fn resolve(client: &Client, rule: &ProxyRule, name: &str, host: &str) -> Option<String> {
     let template = rule.resolve_nip05.as_deref()?;
     let url = template.replace("{name}", &urlencode(name));
     let mut req = client.get(url).timeout(RESOLVE_TIMEOUT);
     for (k, v) in &rule.resolve_headers {
-        req = req.header(k.as_str(), v.as_str());
+        req = req.header(k.as_str(), with_host(v, host));
     }
     let body: Value = req.send().await.ok()?.json().await.ok()?;
     body.get("names")?.as_object()?.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).and_then(|(_, v)| v.as_str()).map(str::to_string)
@@ -68,7 +77,7 @@ fn cors(mut res: Response) -> Response {
     res
 }
 
-async fn handle(State(app): State<Shared>, method: Method, uri: Uri, _headers: HeaderMap) -> Response {
+async fn handle(State(app): State<Shared>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
     if method == Method::OPTIONS {
         let mut res = StatusCode::NO_CONTENT.into_response();
         res.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, HEAD, OPTIONS"));
@@ -82,19 +91,20 @@ async fn handle(State(app): State<Shared>, method: Method, uri: Uri, _headers: H
         return StatusCode::NOT_FOUND.into_response();
     };
     let client = &app.proxy.client;
+    let host = request_host(&headers);
     let target = if rule.resolve_nip05.is_some() && !rest.is_empty() && !is_pubkey(&rest) {
-        resolve(client, rule, &rest).await.unwrap_or(rest)
+        resolve(client, rule, &rest, &host).await.unwrap_or(rest)
     } else {
         rest
     };
-    let mut url = format!("{}{}", rule.upstream, target);
+    let mut url = if rule.forward_path { format!("{}{}", rule.upstream.trim_end_matches('/'), uri.path()) } else { format!("{}{}", rule.upstream, target) };
     if let Some(q) = uri.query() {
         url.push('?');
         url.push_str(q);
     }
     let mut req = client.request(method, url).timeout(Duration::from_secs(rule.timeout_secs.max(1)));
     for (k, v) in &rule.headers {
-        req = req.header(k.as_str(), v.as_str());
+        req = req.header(k.as_str(), with_host(v, &host));
     }
     let upstream = match req.send().await {
         Ok(r) => r,
@@ -226,6 +236,34 @@ mod tests {
         assert_eq!(v["tagged"], true);
         assert_eq!(headers["access-control-allow-origin"], "*");
         assert_eq!(get_(&app, "/.well-known/gone").await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn forward_path_rules_keep_the_path_and_tag_the_request_with_its_own_host() {
+        let base = upstream().await;
+        let rule = ProxyRule {
+            prefix: "/nostr.json".into(),
+            upstream: base.clone(),
+            forward_path: true,
+            headers: HashMap::from([("X-Proxy-Host".to_string(), "{host}".to_string())]),
+            ..Default::default()
+        };
+        let app = app(vec![rule]).await;
+        let res = router(app).oneshot(Request::get("/nostr.json?name=Alice").header("host", "snort.social:443").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), 200);
+        let v: Value = serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["names"]["Alice"], PUBKEY);
+        assert_eq!(v["tagged"], true);
+    }
+
+    #[test]
+    fn the_host_placeholder_uses_the_forwarded_host_without_a_port() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "internal:3000".parse().unwrap());
+        assert_eq!(request_host(&h), "internal");
+        h.insert("x-forwarded-host", "snort.social, other".parse().unwrap());
+        assert_eq!(request_host(&h), "snort.social");
+        assert_eq!(with_host("{host}", "snort.social"), "snort.social");
     }
 
     #[tokio::test]

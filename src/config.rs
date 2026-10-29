@@ -22,6 +22,7 @@ impl Default for Backfill {
 pub struct ProxyRule {
     pub prefix: String,
     pub upstream: String,
+    pub forward_path: bool,
     pub headers: std::collections::HashMap<String, String>,
     pub resolve_nip05: Option<String>,
     pub resolve_headers: std::collections::HashMap<String, String>,
@@ -30,7 +31,7 @@ pub struct ProxyRule {
 
 impl Default for ProxyRule {
     fn default() -> Self {
-        ProxyRule { prefix: String::new(), upstream: String::new(), headers: Default::default(), resolve_nip05: None, resolve_headers: Default::default(), timeout_secs: 10 }
+        ProxyRule { prefix: String::new(), upstream: String::new(), forward_path: false, headers: Default::default(), resolve_nip05: None, resolve_headers: Default::default(), timeout_secs: 10 }
     }
 }
 
