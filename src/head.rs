@@ -164,8 +164,8 @@ fn stripped_tags() -> &'static Regex {
 
 fn overridden(head: &str) -> Vec<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r#"<meta\s+(?:name|property)="([^"]+)"|<(title)>|<(title)\s|<link\s+rel="(canonical)""#).unwrap());
-    re.captures_iter(head).filter_map(|c| (1..=4).find_map(|i| c.get(i)).map(|m| m.as_str().to_string())).collect()
+    let re = RE.get_or_init(|| Regex::new(r#"<meta\s[^>]*?(?:name|property)="([^"]+)"|<(title)[\s>]|<link\s[^>]*?rel="(canonical)""#).unwrap());
+    re.captures_iter(head).filter_map(|c| (1..=3).find_map(|i| c.get(i)).map(|m| m.as_str().to_string())).collect()
 }
 
 fn strip_overridden(shell: &str, head: &str) -> String {
@@ -276,6 +276,18 @@ mod tests {
         assert!(html.contains("rel=\"canonical\" href=\"https://old/\""));
         assert!(html.contains("name=\"description\" content=\"old\""));
         assert!(!html.contains("<title>Old"));
+        assert!(html.contains("og:url\" content=\"old\""));
+    }
+
+    #[test]
+    fn helmet_tags_with_data_attributes_still_replace_the_shell_tags() {
+        let raw = "<title data-rh=\"true\">Stream - zap.stream</title>\n<meta data-rh=\"true\" property=\"og:title\" content=\"Stream\"/>\n<link data-rh=\"true\" rel=\"canonical\" href=\"https://x/s\"/>";
+        let head = Head { raw: Some(raw.into()), ..Default::default() };
+        let html = assemble_raw(SHELL, "", &head_tags(&head, &site(), 200), &json!({}));
+        assert_eq!(html.matches("og:title").count(), 1);
+        assert_eq!(html.matches("<title").count(), 1);
+        assert_eq!(html.matches("rel=\"canonical\"").count(), 1);
+        assert!(html.contains("content=\"Stream\""));
         assert!(html.contains("og:url\" content=\"old\""));
     }
 

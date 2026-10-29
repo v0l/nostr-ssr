@@ -63,6 +63,17 @@ The `snort-social-nip05` worker routes (snort.social nostr.json and lnurlp, zap.
 ]
 ```
 
+## OpenGraph tags
+
+`opengraph` replaces the `nostr-rs-api` `/opengraph/<id>` rewrite that the Pages middleware called. For entity paths
+(`/npub1...`, `/e/nevent1...`, `/p/nprofile1...`, `/naddr1...`, `/note1...`) and bare nostr address paths (`/alice`) the
+event or profile is looked up in the mirror (fetched from upstream relays on a miss) and its tags are merged over the
+bundle's head, replacing matching `og:*`/`twitter:*` metas, the title, the canonical link and the JSON-LD. Kinds: 30311 live
+streams (`og:video` from `streaming` or `recording`, host from the `p` tag with role host, player card), 1313 clips
+(`og:video` from the `r` tag, mp4), profiles (kind 0), everything else as an article. Fields: `twitter_site`,
+`player` (template with `{nevent}`), `avatar` (template with `{pubkey}`), `nip05_url` (template with `{name}`),
+`nip05_headers`, `nip05_domain`, `skip_paths` (bare paths that are real routes, not addresses).
+
 Routes: pages, `/sitemap.xml`, `/sitemap-pages.xml`, `/sitemap-NAME-N.xml`, static client assets.
 
 Test: `cargo test`. Run: `CONFIG=configs/dtan.json DIST=../dtan/dist cargo run`.

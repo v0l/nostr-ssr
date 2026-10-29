@@ -10,3 +10,4 @@ pub mod health;
 pub mod media;
 pub mod sweep;
 pub mod proxy;
+pub mod opengraph;

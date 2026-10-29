@@ -37,6 +37,32 @@ impl Default for ProxyRule {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct OpenGraph {
+    pub twitter_site: Option<String>,
+    pub player: Option<String>,
+    pub avatar: String,
+    pub nip05_url: Option<String>,
+    pub nip05_headers: std::collections::HashMap<String, String>,
+    pub nip05_domain: Option<String>,
+    pub skip_paths: Vec<String>,
+}
+
+impl Default for OpenGraph {
+    fn default() -> Self {
+        OpenGraph {
+            twitter_site: None,
+            player: None,
+            avatar: "https://nostr-api.v0l.io/api/v1/avatar/cyberpunks/{pubkey}.webp".into(),
+            nip05_url: None,
+            nip05_headers: Default::default(),
+            nip05_domain: None,
+            skip_paths: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Health {
     pub filter: Value,
     pub interval_secs: u64,
@@ -98,6 +124,7 @@ pub struct Config {
     pub filters: Vec<Rule>,
     pub health: Option<Health>,
     pub proxy: Vec<ProxyRule>,
+    pub opengraph: Option<OpenGraph>,
     pub static_paths: Vec<String>,
     pub max_events: usize,
     pub sitemap_chunk: usize,
@@ -124,6 +151,7 @@ impl Default for Config {
             filters: vec![],
             health: None,
             proxy: vec![],
+            opengraph: None,
             static_paths: vec!["/".into()],
             max_events: 200_000,
             sitemap_chunk: 40_000,

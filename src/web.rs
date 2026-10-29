@@ -26,13 +26,14 @@ pub struct App {
     pub pages: PageCache,
     pub sitemaps: Sitemaps,
     pub proxy: crate::proxy::Proxy,
+    pub opengraph: crate::opengraph::State,
 }
 
 pub type Shared = Arc<App>;
 
 impl App {
     pub fn new(config: Config, mirror: Mirror, renderer: Option<Renderer>) -> Shared {
-        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default(), proxy: Default::default() })
+        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default(), proxy: Default::default(), opengraph: Default::default() })
     }
 }
 
@@ -137,8 +138,14 @@ async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<
         }
     };
     let site = Site { name: &app.config.site_name, description: &app.config.description, default_image: &app.config.default_image, origin };
-    let tags = head_tags(&rendered.head, &site, rendered.status);
-    let page = if rendered.head.raw.is_some() { assemble_raw(shell_html, &rendered.html, &tags, &rendered.data) } else { assemble(shell_html, &rendered.html, &tags, &rendered.data) };
+    let mut tags = head_tags(&rendered.head, &site, rendered.status);
+    if rendered.status < 400 {
+        if let Some(og) = crate::opengraph::tags_for(&app.opengraph, &app.config, &app.mirror, url, origin).await {
+            tags = crate::opengraph::merge(&tags, &og);
+        }
+    }
+    let raw = rendered.head.raw.is_some() || app.config.opengraph.is_some();
+    let page = if raw { assemble_raw(shell_html, &rendered.html, &tags, &rendered.data) } else { assemble(shell_html, &rendered.html, &tags, &rendered.data) };
     Some((page, rendered.status))
 }
 
@@ -255,6 +262,26 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let (status, body) = get_page(&app, "/nope").await;
         assert_eq!(status, 404);
         assert!(body.contains("noindex") && !body.contains("canonical"));
+    }
+
+    #[tokio::test]
+    async fn entity_pages_get_their_event_tags_merged_over_the_bundle_head() {
+        let mut app = setup("og", BUNDLE);
+        let a = Arc::get_mut(&mut app).unwrap();
+        a.config.opengraph = Some(crate::config::OpenGraph { twitter_site: Some("@t".into()), ..Default::default() });
+        let keys = Keys::new(SecretKey::from_slice(&[5; 32]).unwrap());
+        let live = EventBuilder::new(Kind::from(30311), "").tags([Tag::identifier("room"), Tag::parse(["title", "Show"]).unwrap(), Tag::parse(["streaming", "https://cdn/l.m3u8"]).unwrap()]).finalize(&keys).unwrap();
+        app.mirror.database.save_event(&live).await.unwrap();
+        let naddr = nostr::nips::nip19::Nip19Coordinate::new(live.coordinate().unwrap(), Vec::<RelayUrl>::new()).to_bech32().unwrap();
+        let (status, body) = get_page(&app, &format!("/{naddr}")).await;
+        assert_eq!(status, 200);
+        assert!(body.contains("property=\"og:video\" content=\"https://cdn/l.m3u8\""));
+        assert!(body.contains("<title>Nostrich is streaming</title>"));
+        assert_eq!(body.matches("<title").count(), 1);
+        assert_eq!(body.matches("rel=\"canonical\"").count(), 1);
+        assert!(body.contains(&format!("https://t.example/{naddr}")));
+        let (_, home) = get_page(&app, "/").await;
+        assert!(!home.contains("og:video"));
     }
 
     #[tokio::test]
