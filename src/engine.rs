@@ -62,7 +62,10 @@ impl Engine {
         let misses: Arc<Mutex<Vec<Value>>> = Default::default();
         let m = misses.clone();
         ctx.with(|ctx| {
+            let hidden_mirror = mirror.clone();
             let query = Function::new(ctx.clone(), move |filters: String| -> String { run_filters(&mirror, &handle, &filters, &m) }).map_err(|e| e.to_string())?;
+            let hidden = Function::new(ctx.clone(), move || -> String { serde_json::to_string(&hidden_mirror.hidden_keys()).unwrap_or_else(|_| "[]".into()) }).map_err(|e| e.to_string())?;
+            ctx.globals().set("relayHidden", hidden).map_err(|e| e.to_string())?;
             ctx.globals().set("relayQuery", query).map_err(|e| e.to_string())?;
             let log = Function::new(ctx.clone(), |level: String, msg: String| tracing::warn!("ssr {level}: {msg}")).map_err(|e| e.to_string())?;
             ctx.globals().set("hostLog", log).map_err(|e| e.to_string())?;
@@ -163,6 +166,22 @@ mod tests {
         let miss = r.call("ssrRender", json!([{"kinds": [30023]}]).to_string()).await.unwrap();
         assert_eq!(miss.text, "{\"found\":0}");
         assert_eq!(miss.misses, vec![json!({"kinds": [30023]})]);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_can_read_the_keys_its_result_filters_hide() {
+        struct Hide;
+        impl crate::filters::ResultFilter for Hide {
+            fn keep(&self, _: &nostr::Event) -> bool {
+                true
+            }
+            fn hidden_keys(&self) -> Vec<String> {
+                vec!["b".into(), "a".into()]
+            }
+        }
+        let mirror = Mirror::new(0, None, &[]).with_filters(vec![std::sync::Arc::new(Hide)]);
+        let r = Renderer::start(bundle("hidden", "globalThis.ssrRender = () => relayHidden();"), 1, mirror);
+        assert_eq!(r.call("ssrRender", "".into()).await.unwrap().text, "[\"a\",\"b\"]");
     }
 
     #[tokio::test]

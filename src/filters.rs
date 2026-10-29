@@ -13,6 +13,10 @@ pub trait ResultFilter: Send + Sync {
 
     fn prepare(&self) {}
 
+    fn hidden_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     fn keep(&self, event: &Event) -> bool;
 }
 

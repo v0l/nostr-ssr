@@ -25,6 +25,10 @@ impl ResultFilter for DeadMedia {
         Some(&self.kinds)
     }
 
+    fn hidden_keys(&self) -> Vec<String> {
+        self.health.dead_keys()
+    }
+
     fn keep(&self, event: &Event) -> bool {
         media::parse(event).is_none_or(|m| !self.health.is_dead(&m.key))
     }
@@ -114,5 +118,6 @@ mod tests {
         assert_eq!(checked, 2);
         let shown = mirror.query(&[json!({"kinds": [21], "limit": 5})]).await;
         assert_eq!(shown.iter().map(|e| e.id).collect::<Vec<_>>(), vec![alive.id]);
+        assert_eq!(mirror.hidden_keys(), vec![format!("{}", media::parse(&gone).unwrap().key)]);
     }
 }

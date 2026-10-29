@@ -91,6 +91,13 @@ impl Mirror {
         self
     }
 
+    pub fn hidden_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.filters.iter().flat_map(|f| f.hidden_keys()).collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     pub fn priority_loaded(&self) -> bool {
         self.priority_loaded.load(Ordering::Acquire)
     }
