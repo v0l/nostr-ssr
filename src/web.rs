@@ -5,7 +5,7 @@ use crate::engine::Renderer;
 use crate::head::{assemble, assemble_raw, head_tags, Head, Site};
 use crate::mirror::{parse_filter, Mirror};
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -54,9 +54,23 @@ pub fn router(app: Shared) -> Router {
         .route("/sitemap-pages.xml", get(crate::sitemap::pages))
         .route("/sitemap-{file}", get(crate::sitemap::file))
         .fallback_service(assets.fallback(get(page).with_state(app.clone())))
+        .layer(axum::middleware::from_fn_with_state(app.clone(), custom_headers))
         .layer(axum::middleware::map_response(cache_assets))
         .layer(CompressionLayer::new())
         .with_state(app)
+}
+
+async fn custom_headers(State(app): State<Shared>, req: Request, next: axum::middleware::Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut res = next.run(req).await;
+    for rule in app.config.headers.iter().filter(|r| path.starts_with(&r.prefix)) {
+        for (k, v) in &rule.set {
+            if let (Ok(k), Ok(v)) = (axum::http::HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+                res.headers_mut().insert(k, v);
+            }
+        }
+    }
+    res
 }
 
 async fn cache_assets(uri: axum::extract::OriginalUri, mut res: Response) -> Response {
@@ -149,14 +163,23 @@ async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<
     Some((page, rendered.status))
 }
 
+async fn shell_with_tags(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<String> {
+    let tags = crate::opengraph::tags_for(&app.opengraph, &app.config, &app.mirror, url, origin).await?;
+    let head = crate::opengraph::merge("", &tags);
+    Some(assemble_raw(shell_html, "", &head, &json!({})))
+}
+
 pub async fn page_for(app: Shared, headers: HeaderMap, url: String) -> Response {
     let Some(shell_html) = shell(&app) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "client build missing").into_response();
     };
-    if app.renderer.is_none() {
-        return html(200, plain_shell(&shell_html));
-    }
     let origin = origin(&app, &headers);
+    if app.renderer.is_none() {
+        return match shell_with_tags(&app, &origin, &shell_html, &url).await {
+            Some(page) => html(200, page),
+            None => html(200, plain_shell(&shell_html)),
+        };
+    }
     let produce = {
         let (app, origin, shell_html, url) = (app.clone(), origin.clone(), shell_html.clone(), url.clone());
         move || {
@@ -282,6 +305,28 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         assert!(body.contains(&format!("https://t.example/{naddr}")));
         let (_, home) = get_page(&app, "/").await;
         assert!(!home.contains("og:video"));
+    }
+
+    #[tokio::test]
+    async fn without_a_bundle_the_shell_is_served_with_event_tags_and_custom_headers() {
+        let mut app = setup("shell", BUNDLE);
+        let a = Arc::get_mut(&mut app).unwrap();
+        a.renderer = None;
+        a.config.opengraph = Some(crate::config::OpenGraph::default());
+        a.config.headers = vec![crate::config::HeaderRule { prefix: "/".into(), set: [("Cross-Origin-Opener-Policy".to_string(), "same-origin".to_string())].into() }];
+        let keys = Keys::new(SecretKey::from_slice(&[6; 32]).unwrap());
+        let ev = EventBuilder::text_note("hello shell").finalize(&keys).unwrap();
+        app.mirror.database.save_event(&ev).await.unwrap();
+        let note = ev.id.to_bech32().unwrap();
+        let res = router(app.clone()).oneshot(Request::get(format!("/{note}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.headers()["cross-origin-opener-policy"], "same-origin");
+        let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("og:article:published_time") && body.contains("hello shell"));
+        assert_eq!(body.matches("<title").count(), 1);
+        assert!(body.contains("<div id=\"root\"></div>"));
+        let (status, plain) = get_page(&app, "/streams").await;
+        assert_eq!(status, 200);
+        assert!(!plain.contains("og:article"));
     }
 
     #[tokio::test]

@@ -193,6 +193,10 @@ impl Mirror {
     }
 
     pub async fn follow(&self, urls: &[String], backfills: &[Backfill]) -> anyhow::Result<()> {
+        self.follow_with(urls, backfills, true).await
+    }
+
+    pub async fn follow_with(&self, urls: &[String], backfills: &[Backfill], live: bool) -> anyhow::Result<()> {
         if urls.is_empty() {
             self.mark_loaded();
             return Ok(());
@@ -201,12 +205,18 @@ impl Mirror {
             self.client.add_relay(url.as_str()).await?;
         }
         self.client.connect().and_wait(Duration::from_secs(15)).await;
-        tokio::spawn(forward_to_relay(self.clone()));
-        let mut live = Filter::new().since(Timestamp::now());
-        if !self.kinds.is_empty() {
-            live = live.kinds(self.kinds.iter().copied());
+        if !live {
+            let me = self.clone();
+            tokio::spawn(async move { me.profile_loop().await });
+            self.mark_loaded();
+            return Ok(());
         }
-        self.client.subscribe(vec![live]).await?;
+        tokio::spawn(forward_to_relay(self.clone()));
+        let mut subscription = Filter::new().since(Timestamp::now());
+        if !self.kinds.is_empty() {
+            subscription = subscription.kinds(self.kinds.iter().copied());
+        }
+        self.client.subscribe(vec![subscription]).await?;
         let me = self.clone();
         tokio::spawn(async move { me.profile_loop().await });
         for b in backfills.iter().filter(|b| b.priority) {
@@ -389,6 +399,22 @@ mod tests {
         let got = m.query(&[json!({"kinds": [2003], "limit": 2})]).await;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].created_at.as_secs(), 10);
+    }
+
+    #[tokio::test]
+    async fn on_demand_mode_connects_for_fetches_but_does_not_stream_or_backfill() {
+        let upstream = MockRelay::run().await.unwrap();
+        let ev = note(1, 100, "wanted", vec![]);
+        upstream.add_event(ev.clone()).await.unwrap();
+        let m = Mirror::new(0, None, &[]);
+        m.follow_with(&[upstream.url().await.to_string()], &[backfill(json!({"kinds": [2003]}), true)], false).await.unwrap();
+        assert!(m.priority_loaded());
+        assert_eq!(m.len().await, 0);
+        let got = m.fetch(vec![Filter::new().id(ev.id)], Duration::from_secs(5)).await;
+        assert_eq!(got, 1);
+        upstream.add_event(note(1, Timestamp::now().as_secs(), "live", vec![])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(m.len().await, 1);
     }
 
     #[tokio::test]

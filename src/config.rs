@@ -35,6 +35,13 @@ impl Default for ProxyRule {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct HeaderRule {
+    pub prefix: String,
+    pub set: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct OpenGraph {
@@ -117,6 +124,7 @@ pub struct Config {
     pub public_url: Option<String>,
     pub default_image: String,
     pub relays: Vec<String>,
+    pub live: bool,
     pub kinds: Vec<u16>,
     pub backfill: Vec<Backfill>,
     pub sitemap: Vec<SitemapSource>,
@@ -125,6 +133,7 @@ pub struct Config {
     pub health: Option<Health>,
     pub proxy: Vec<ProxyRule>,
     pub opengraph: Option<OpenGraph>,
+    pub headers: Vec<HeaderRule>,
     pub static_paths: Vec<String>,
     pub max_events: usize,
     pub sitemap_chunk: usize,
@@ -144,6 +153,7 @@ impl Default for Config {
             public_url: None,
             default_image: "/banner.jpg".into(),
             relays: vec![],
+            live: true,
             kinds: vec![],
             backfill: vec![],
             sitemap: vec![],
@@ -152,6 +162,7 @@ impl Default for Config {
             health: None,
             proxy: vec![],
             opengraph: None,
+            headers: vec![],
             static_paths: vec!["/".into()],
             max_events: 200_000,
             sitemap_chunk: 40_000,

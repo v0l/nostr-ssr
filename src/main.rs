@@ -20,19 +20,19 @@ async fn main() -> anyhow::Result<()> {
         mirror.relay.run().await?;
         tracing::info!("relay on {}", mirror.relay.url().await);
     }
-    let (m, relays, backfill) = (mirror.clone(), config.relays.clone(), config.backfill.clone());
+    let (m, relays, backfill, live) = (mirror.clone(), config.relays.clone(), config.backfill.clone(), config.live);
     tokio::spawn(async move {
-        if let Err(e) = m.follow(&relays, &backfill).await {
+        if let Err(e) = m.follow_with(&relays, &backfill, live).await {
             tracing::error!("follow failed: {e}");
         }
         let events = m.len().await;
         tracing::info!(events, "initial sync complete");
     });
 
-    let renderer = Renderer::start(config.bundle_path(), config.workers, mirror.clone());
+    let renderer = config.bundle_path().exists().then(|| Renderer::start(config.bundle_path(), config.workers, mirror.clone()));
     let bind = config.bind.clone();
     let warm = config.warm.clone();
-    let app = App::new(config, mirror, Some(renderer));
+    let app = App::new(config, mirror, renderer);
     if !warm.is_empty() {
         let app = app.clone();
         tokio::spawn(async move {

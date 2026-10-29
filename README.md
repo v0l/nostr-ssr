@@ -74,6 +74,13 @@ streams (`og:video` from `streaming` or `recording`, host from the `p` tag with 
 `player` (template with `{nevent}`), `avatar` (template with `{pubkey}`), `nip05_url` (template with `{name}`),
 `nip05_headers`, `nip05_domain`, `skip_paths` (bare paths that are real routes, not addresses).
 
+## Sites without an SSR bundle
+
+If `dist/ssr/render.js` does not exist the server serves the client shell and still merges `opengraph` tags for entity
+and address paths, so a plain SPA (snort) gets per-event previews without writing a renderer. `live: false` stops the
+relay stream and backfills, so the mirror only holds what pages fetch on demand. `headers` adds response headers by path prefix
+(for example a Content-Security-Policy that nginx used to set).
+
 Routes: pages, `/sitemap.xml`, `/sitemap-pages.xml`, `/sitemap-NAME-N.xml`, static client assets.
 
 Test: `cargo test`. Run: `CONFIG=configs/dtan.json DIST=../dtan/dist cargo run`.
