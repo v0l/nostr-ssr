@@ -139,7 +139,7 @@ mod tests {
     }
 
     fn event(n: u8, kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
-        EventBuilder::new(Kind::from(kind), content).tags(tags.into_iter().map(|t| Tag::parse(t).unwrap())).finalize(&keys(n)).unwrap()
+        EventBuilder::new(Kind::from(kind), content).tags(tags.into_iter().map(|t| Tag::parse(t).unwrap())).custom_created_at(Timestamp::from_secs(1_700_000_000)).finalize(&keys(n)).unwrap()
     }
 
     fn filters(json: &str) -> Vec<Arc<dyn ResultFilter>> {
