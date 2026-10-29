@@ -12,7 +12,7 @@ name = "nostr-ssr"
 path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 anyhow = "1"
 nostr = "=0.45.0-alpha.3"
 nostr-database = "=0.45.0-alpha.3"

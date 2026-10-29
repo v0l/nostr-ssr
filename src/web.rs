@@ -2,7 +2,7 @@ use crate::cache::PageCache;
 use crate::config::Config;
 use crate::sitemap::Sitemaps;
 use crate::engine::Renderer;
-use crate::head::{assemble, head_tags, Head, Site};
+use crate::head::{assemble, assemble_raw, head_tags, Head, Site};
 use crate::mirror::{parse_filter, Mirror};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -25,13 +25,14 @@ pub struct App {
     pub renderer: Option<Renderer>,
     pub pages: PageCache,
     pub sitemaps: Sitemaps,
+    pub proxy: crate::proxy::Proxy,
 }
 
 pub type Shared = Arc<App>;
 
 impl App {
     pub fn new(config: Config, mirror: Mirror, renderer: Option<Renderer>) -> Shared {
-        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default() })
+        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default(), proxy: Default::default() })
     }
 }
 
@@ -47,7 +48,7 @@ struct Rendered {
 
 pub fn router(app: Shared) -> Router {
     let assets = ServeDir::new(app.config.client_dir()).append_index_html_on_directories(false);
-    Router::new()
+    crate::proxy::routes(&app.config.proxy)
         .route("/sitemap.xml", get(crate::sitemap::index))
         .route("/sitemap-pages.xml", get(crate::sitemap::pages))
         .route("/sitemap-{file}", get(crate::sitemap::file))
@@ -137,7 +138,8 @@ async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<
     };
     let site = Site { name: &app.config.site_name, description: &app.config.description, default_image: &app.config.default_image, origin };
     let tags = head_tags(&rendered.head, &site, rendered.status);
-    Some((assemble(shell_html, &rendered.html, &tags, &rendered.data), rendered.status))
+    let page = if rendered.head.raw.is_some() { assemble_raw(shell_html, &rendered.html, &tags, &rendered.data) } else { assemble(shell_html, &rendered.html, &tags, &rendered.data) };
+    Some((page, rendered.status))
 }
 
 pub async fn page_for(app: Shared, headers: HeaderMap, url: String) -> Response {

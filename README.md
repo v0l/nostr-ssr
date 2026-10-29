@@ -39,6 +39,21 @@ Files are `/sitemap-<name>-<n>.xml`, oldest first, so existing files stay byte-s
 the last file grows. The index carries a `lastmod` per file. The snapshot is built once per `sitemap_ttl_secs` and only
 holds ids, not events, so requests do not re-query the store.
 
+## Proxy rules
+
+`proxy` replaces the Cloudflare Pages functions and page rules that forward paths to another server. Each rule has
+`prefix` (ends in `/` for one path segment under it, otherwise an exact path), `upstream` (URL the remainder is appended
+to; the query string is forwarded), `headers` (sent upstream), `timeout_secs`, and optionally `resolve_nip05` (a URL
+template with `{name}`) plus `resolve_headers`. With `resolve_nip05`, a segment that is not a 64 char hex pubkey is looked up
+as a nostr address first and the pubkey is substituted, falling back to the raw segment. Only GET, HEAD and OPTIONS are
+served; responses get `access-control-allow-origin: *` and `cache-control: no-store`. Example (zap.stream lnurlp):
+
+```json
+{"prefix": "/.well-known/lnurlp/", "upstream": "https://api-core.zap.stream/.well-known/lnurlp/",
+ "resolve_nip05": "https://api.snort.social/.well-known/nostr.json?name={name}",
+ "resolve_headers": {"X-Proxy-Host": "zap.stream"}}
+```
+
 Routes: pages, `/sitemap.xml`, `/sitemap-pages.xml`, `/sitemap-NAME-N.xml`, static client assets.
 
 Test: `cargo test`. Run: `CONFIG=configs/dtan.json DIST=../dtan/dist cargo run`.

@@ -19,6 +19,23 @@ impl Default for Backfill {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct ProxyRule {
+    pub prefix: String,
+    pub upstream: String,
+    pub headers: std::collections::HashMap<String, String>,
+    pub resolve_nip05: Option<String>,
+    pub resolve_headers: std::collections::HashMap<String, String>,
+    pub timeout_secs: u64,
+}
+
+impl Default for ProxyRule {
+    fn default() -> Self {
+        ProxyRule { prefix: String::new(), upstream: String::new(), headers: Default::default(), resolve_nip05: None, resolve_headers: Default::default(), timeout_secs: 10 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Health {
     pub filter: Value,
     pub interval_secs: u64,
@@ -79,6 +96,7 @@ pub struct Config {
     pub sitemap_ttl_secs: u64,
     pub filters: Vec<Rule>,
     pub health: Option<Health>,
+    pub proxy: Vec<ProxyRule>,
     pub static_paths: Vec<String>,
     pub max_events: usize,
     pub sitemap_chunk: usize,
@@ -104,6 +122,7 @@ impl Default for Config {
             sitemap_ttl_secs: 300,
             filters: vec![],
             health: None,
+            proxy: vec![],
             static_paths: vec!["/".into()],
             max_events: 200_000,
             sitemap_chunk: 40_000,

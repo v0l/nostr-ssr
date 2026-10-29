@@ -16,6 +16,7 @@ pub struct Head {
     pub modified: Option<String>,
     pub noindex: Option<bool>,
     pub json_ld: Option<Value>,
+    pub raw: Option<String>,
 }
 
 pub struct Site<'a> {
@@ -65,6 +66,9 @@ fn meta(out: &mut Vec<String>, kind: &str, name: &str, content: &str) {
 }
 
 pub fn head_tags(head: &Head, site: &Site, status: u16) -> String {
+    if let Some(raw) = &head.raw {
+        return raw.clone();
+    }
     let title = match &head.title {
         Some(t) if !t.is_empty() => format!("{t} | {}", site.name),
         _ => site.name.to_string(),
@@ -158,8 +162,39 @@ fn stripped_tags() -> &'static Regex {
     })
 }
 
+fn overridden(head: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"<meta\s+(?:name|property)="([^"]+)"|<(title)>|<(title)\s|<link\s+rel="(canonical)""#).unwrap());
+    re.captures_iter(head).filter_map(|c| (1..=4).find_map(|i| c.get(i)).map(|m| m.as_str().to_string())).collect()
+}
+
+fn strip_overridden(shell: &str, head: &str) -> String {
+    let names = overridden(head);
+    let re = stripped_tags();
+    re.replace_all(shell, |c: &regex::Captures| {
+        let tag = c.get(0).unwrap().as_str();
+        let hit = if tag.contains("<title>") {
+            names.iter().any(|n| n == "title")
+        } else if tag.contains("canonical") {
+            names.iter().any(|n| n == "canonical")
+        } else {
+            names.iter().any(|n| tag.contains(&format!("=\"{n}\"")))
+        };
+        if hit { String::new() } else { tag.to_string() }
+    })
+    .into_owned()
+}
+
+pub fn assemble_raw(shell: &str, body: &str, head: &str, data: &Value) -> String {
+    assemble_with(strip_overridden(shell, head), body, head, data)
+}
+
 pub fn assemble(shell: &str, body: &str, head: &str, data: &Value) -> String {
-    let mut page = stripped_tags().replace_all(shell, "").into_owned();
+    assemble_with(stripped_tags().replace_all(shell, "").into_owned(), body, head, data)
+}
+
+fn assemble_with(shell: String, body: &str, head: &str, data: &Value) -> String {
+    let mut page = shell;
     if let Some(i) = page.find("</head>") {
         page.insert_str(i, &format!("    {head}\n  "));
     }
@@ -228,6 +263,20 @@ mod tests {
         let parsed: Value = serde_json::from_str(ld).unwrap();
         assert_eq!(parsed["url"], "https://dtan.xyz/e/a");
         assert_eq!(parsed["name"], "</script>");
+    }
+
+    #[test]
+    fn raw_head_html_from_the_bundle_replaces_the_shell_tags_untouched() {
+        let head = Head { raw: Some("<title>Stream - zap.stream</title>\n    <meta property=\"og:type\" content=\"video\" />".into()), ..Default::default() };
+        let tags = head_tags(&head, &site(), 200);
+        let html = assemble_raw(SHELL, "", &tags, &json!({}));
+        assert_eq!(html.matches("<title>").count(), 1);
+        assert!(html.contains("<title>Stream - zap.stream</title>"));
+        assert!(html.contains("og:type\" content=\"video\""));
+        assert!(html.contains("rel=\"canonical\" href=\"https://old/\""));
+        assert!(html.contains("name=\"description\" content=\"old\""));
+        assert!(!html.contains("<title>Old"));
+        assert!(html.contains("og:url\" content=\"old\""));
     }
 
     #[test]

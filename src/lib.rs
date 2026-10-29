@@ -9,3 +9,4 @@ pub mod web;
 pub mod health;
 pub mod media;
 pub mod sweep;
+pub mod proxy;
