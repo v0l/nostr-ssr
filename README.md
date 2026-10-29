@@ -54,11 +54,13 @@ served; responses get `access-control-allow-origin: *` and `cache-control: no-st
  "resolve_headers": {"X-Proxy-Host": "zap.stream"}}
 ```
 
-snort.social (the `snort-social-nip05` worker, same rule for `/.well-known/lnurlp/` if it is routed there):
+The `snort-social-nip05` worker routes (snort.social nostr.json and lnurlp, zap.stream nostr.json, nostr.gg nostr.json) all forward to `api.snort.social` with the request host. Rules are host agnostic, so one config serves every domain pointed at the server:
 
 ```json
-{"prefix": "/.well-known/nostr.json", "upstream": "https://api.snort.social", "forward_path": true,
- "headers": {"X-Proxy-Host": "{host}"}}
+[
+  {"prefix": "/.well-known/nostr.json", "upstream": "https://api.snort.social", "forward_path": true, "headers": {"X-Proxy-Host": "{host}"}},
+  {"prefix": "/.well-known/lnurlp/", "upstream": "https://api.snort.social", "forward_path": true, "headers": {"X-Proxy-Host": "{host}"}}
+]
 ```
 
 Routes: pages, `/sitemap.xml`, `/sitemap-pages.xml`, `/sitemap-NAME-N.xml`, static client assets.
