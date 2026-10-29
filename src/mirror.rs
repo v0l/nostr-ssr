@@ -77,7 +77,13 @@ impl Mirror {
     }
 
     pub fn from_config(config: &Config) -> anyhow::Result<Mirror> {
-        Ok(Mirror::new(config.max_events, config.relay_port, &config.kinds).with_filters(filters::build(&config.filters)?))
+        Mirror::from_config_with(config, vec![])
+    }
+
+    pub fn from_config_with(config: &Config, extra: Vec<Arc<dyn ResultFilter>>) -> anyhow::Result<Mirror> {
+        let mut all = filters::build(&config.filters)?;
+        all.extend(extra);
+        Ok(Mirror::new(config.max_events, config.relay_port, &config.kinds).with_filters(all))
     }
 
     pub fn with_filters(mut self, filters: Vec<Arc<dyn ResultFilter>>) -> Mirror {

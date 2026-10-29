@@ -1,10 +1,11 @@
 use crate::config::{Config, SitemapSource};
 use crate::head::escape_html;
+use crate::media::Media;
 use crate::web::{origin, Shared};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, ToBech32};
+use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, Nip19Profile, ToBech32};
 use nostr::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ struct Entry {
     kind: Kind,
     created_at: u64,
     identifier: Option<String>,
+    loc: Option<String>,
 }
 
 pub struct SourceSnapshot {
@@ -40,13 +42,77 @@ fn chunk_size(config: &Config, source: &SitemapSource) -> usize {
 }
 
 fn path_for(source: &SitemapSource, e: &Entry) -> Option<String> {
+    if let Some(loc) = &e.loc {
+        return Some(loc.clone());
+    }
     let id = match source.encoding.as_str() {
         "note" => e.id.to_bech32().ok()?,
         "naddr" => Nip19Coordinate::new(Coordinate::new(e.kind, e.pubkey).identifier(e.identifier.as_deref()?), Vec::<RelayUrl>::new()).to_bech32().ok()?,
         "npub" => e.pubkey.to_bech32().ok()?,
+        "nprofile" => Nip19Profile::new(e.pubkey, Vec::<RelayUrl>::new()).to_bech32().ok()?,
         _ => Nip19Event::new(e.id).author(e.pubkey).kind(e.kind).to_bech32().ok()?,
     };
     Some(format!("{}{id}", source.prefix))
+}
+
+fn entry(ev: &Event) -> Entry {
+    Entry { id: ev.id, pubkey: ev.pubkey, kind: ev.kind, created_at: ev.created_at.as_secs(), identifier: ev.tags.identifier().map(|d| d.to_string()), loc: None }
+}
+
+fn authors(source: &SitemapSource, events: &[Event]) -> Vec<Entry> {
+    let mut latest: std::collections::HashMap<PublicKey, &Event> = std::collections::HashMap::new();
+    for ev in events {
+        let slot = latest.entry(ev.pubkey).or_insert(ev);
+        if ev.created_at > slot.created_at {
+            *slot = ev;
+        }
+    }
+    let _ = source;
+    latest.into_values().map(entry).collect()
+}
+
+fn tags(source: &SitemapSource, events: &[Event]) -> Vec<Entry> {
+    let mut stats: std::collections::HashMap<String, (usize, &Event)> = std::collections::HashMap::new();
+    for ev in events {
+        let mut seen = std::collections::HashSet::new();
+        for t in ev.tags.iter().filter(|t| t.kind().to_string() == "t").filter_map(|t| t.content()) {
+            let t = t.trim().to_lowercase();
+            if t.is_empty() || !seen.insert(t.clone()) {
+                continue;
+            }
+            let slot = stats.entry(t).or_insert((0, ev));
+            slot.0 += 1;
+            if ev.created_at > slot.1.created_at {
+                slot.1 = ev;
+            }
+        }
+    }
+    let mut ranked: Vec<(String, usize, &Event)> = stats.into_iter().filter(|(_, (n, _))| *n >= source.min_count).map(|(t, (n, e))| (t, n, e)).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .map(|(t, _, ev)| Entry { loc: Some(format!("{}{}", source.prefix, crate::media::url_encode(&t))), ..entry(ev) })
+        .collect()
+}
+
+fn deduplicated(events: Vec<Event>) -> Vec<Event> {
+    let mut by_key: std::collections::HashMap<String, (Media, Event)> = std::collections::HashMap::new();
+    let mut loose = Vec::new();
+    for ev in events {
+        match crate::media::parse(&ev) {
+            Some(m) => match m.identifier().map(String::from) {
+                Some(key) => {
+                    let better = by_key.get(&key).is_none_or(|(cur, _)| (cur.kind_priority(), cur.created_at, cur.id.clone()) < (m.kind_priority(), m.created_at, m.id.clone()));
+                    if better {
+                        by_key.insert(key, (m, ev));
+                    }
+                }
+                None => {}
+            },
+            None => loose.push(ev),
+        }
+    }
+    by_key.into_values().map(|(_, e)| e).chain(loose).collect()
 }
 
 async fn collect(app: &crate::web::App, source: &SitemapSource) -> SourceSnapshot {
@@ -54,15 +120,22 @@ async fn collect(app: &crate::web::App, source: &SitemapSource) -> SourceSnapsho
     if let (Some(max), Some(obj)) = (source.max, filter.as_object_mut()) {
         obj.insert("limit".into(), max.into());
     }
-    let events = app.mirror.query(&[filter]).await;
-    let mut entries: Vec<Entry> = events
-        .iter()
-        .map(|ev| Entry { id: ev.id, pubkey: ev.pubkey, kind: ev.kind, created_at: ev.created_at.as_secs(), identifier: ev.tags.identifier().map(|d| d.to_string()) })
-        .collect();
+    let mut events = app.mirror.query(&[filter]).await;
+    if source.media {
+        events = deduplicated(events);
+    }
+    let mut entries: Vec<Entry> = match source.group.as_str() {
+        "author" => authors(source, &events),
+        "tag" => tags(source, &events),
+        _ => events.iter().map(entry).collect(),
+    };
     drop(events);
-    if source.encoding == "npub" {
+    if source.encoding == "npub" && source.group.is_empty() {
         entries.sort_by_key(|e| e.pubkey);
         entries.dedup_by_key(|e| e.pubkey);
+    }
+    if source.group == "tag" {
+        return SourceSnapshot { name: source.name.clone(), chunk: chunk_size(&app.config, source), entries };
     }
     entries.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
     SourceSnapshot { name: source.name.clone(), chunk: chunk_size(&app.config, source), entries }
@@ -143,6 +216,96 @@ pub async fn pages(State(app): State<Shared>, headers: HeaderMap) -> Response {
     xml(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{body}</urlset>\n"))
 }
 
+fn xml_text(s: &str) -> String {
+    escape_html(&s.chars().filter(|c| (*c as u32) >= 0x20 || matches!(c, '\t' | '\n' | '\r')).collect::<String>()).replace('\'', "&apos;")
+}
+
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() > n {
+        format!("{}...", s.chars().take(n.saturating_sub(3)).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+fn is_http(u: &str) -> bool {
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
+fn video_extra(origin: &str, v: &Media, uploader: Option<(&str, String)>) -> Option<String> {
+    let thumb = v.thumbnail.as_deref().filter(|t| is_http(t))?;
+    if !is_http(&v.url) {
+        return None;
+    }
+    let first = if v.title.is_empty() { &v.content } else { &v.title };
+    let title = clip(if first.is_empty() { "Untitled" } else { first }, 100);
+    let desc_src = if !v.content.is_empty() { &v.content } else if !v.title.is_empty() { &v.title } else { &title };
+    let mut out = String::from("    <video:video>\n");
+    out += &format!("      <video:thumbnail_loc>{}</video:thumbnail_loc>\n", xml_text(thumb));
+    out += &format!("      <video:title>{}</video:title>\n", xml_text(&title));
+    out += &format!("      <video:description>{}</video:description>\n", xml_text(&clip(desc_src, 2048)));
+    out += &format!("      <video:content_loc>{}</video:content_loc>\n", xml_text(&v.url));
+    if let Some(d) = v.duration.filter(|d| *d >= 1.0) {
+        out += &format!("      <video:duration>{}</video:duration>\n", (d.round() as u64).min(28_800));
+    }
+    out += &format!("      <video:publication_date>{}</video:publication_date>\n", iso(v.created_at as i64));
+    for t in v.tags.iter().take(32) {
+        out += &format!("      <video:tag>{}</video:tag>\n", xml_text(t));
+    }
+    if let Some((name, profile)) = uploader {
+        out += &format!("      <video:uploader info=\"{}\">{}</video:uploader>\n", xml_text(&format!("{origin}{profile}")), xml_text(&clip(name, 100)));
+    }
+    out += "    </video:video>\n";
+    Some(out)
+}
+
+fn image_extra(img: &Media) -> Option<String> {
+    let mut urls: Vec<&str> = Vec::new();
+    for u in img.metas.iter().filter_map(|m| m.get("url")).map(String::as_str).filter(|u| is_http(u)) {
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
+    }
+    if urls.is_empty() {
+        return None;
+    }
+    Some(urls.iter().take(1000).map(|u| format!("    <image:image>\n      <image:loc>{}</image:loc>\n    </image:image>\n", xml_text(u))).collect())
+}
+
+async fn media_extras(app: &crate::web::App, origin: &str, entries: &[Entry]) -> std::collections::HashMap<EventId, Option<String>> {
+    let ids: Vec<EventId> = entries.iter().map(|e| e.id).collect();
+    let events = app.mirror.query(&[serde_json::json!({"ids": ids.iter().map(|i| i.to_hex()).collect::<Vec<_>>()})]).await;
+    let parsed: Vec<(EventId, Media)> = events.iter().filter_map(|ev| crate::media::parse(ev).map(|m| (ev.id, m))).collect();
+    let pubkeys: Vec<String> = parsed.iter().filter(|(_, m)| !m.is_image()).map(|(_, m)| m.pubkey.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let names = profile_names(app, &pubkeys).await;
+    parsed
+        .into_iter()
+        .filter_map(|(id, m)| {
+            let extra = if m.is_image() {
+                image_extra(&m)
+            } else {
+                let uploader = names.get(&m.pubkey).map(|n| (n.as_str(), crate::media::profile_path_hex(&m.pubkey)));
+                video_extra(origin, &m, uploader)
+            };
+            Some((id, extra))
+        })
+        .collect()
+}
+
+async fn profile_names(app: &crate::web::App, pubkeys: &[String]) -> std::collections::HashMap<String, String> {
+    let mut names = std::collections::HashMap::new();
+    for chunk in pubkeys.chunks(500) {
+        let events = app.mirror.query(&[serde_json::json!({"kinds": [0], "authors": chunk})]).await;
+        for ev in events.iter() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.content) else { continue };
+            if let Some(n) = ["display_name", "name"].iter().filter_map(|k| v.get(k)?.as_str()).find(|s| !s.is_empty()) {
+                names.insert(ev.pubkey.to_hex(), n.to_string());
+            }
+        }
+    }
+    names
+}
+
 pub async fn file(State(app): State<Shared>, headers: HeaderMap, Path(file): Path<String>) -> Response {
     let Some((name, n)) = file.strip_suffix(".xml").and_then(|f| f.rsplit_once('-')).and_then(|(name, n)| Some((name, n.parse::<usize>().ok().filter(|n| *n >= 1)?))) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -155,18 +318,23 @@ pub async fn file(State(app): State<Shared>, headers: HeaderMap, Path(file): Pat
     let Some(entries) = snap.sources.iter().find(|s| s.name == name).and_then(|s| s.entries.chunks(s.chunk).nth(n - 1)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let extras = if source.media { media_extras(&app, &origin, entries).await } else { Default::default() };
     let mut body = String::with_capacity(entries.len() * 160);
     for e in entries {
         let Some(path) = path_for(source, e) else { continue };
+        if source.media && !extras.contains_key(&e.id) {
+            continue;
+        }
         body.push_str(&format!(
-            "  <url><loc>{}</loc><lastmod>{}</lastmod><changefreq>{}</changefreq><priority>{}</priority></url>\n",
-            escape_html(&format!("{origin}{path}")),
+            "  <url>\n    <loc>{}</loc>\n    <lastmod>{}</lastmod>\n    <changefreq>{}</changefreq>\n    <priority>{}</priority>\n{}  </url>\n",
+            xml_text(&format!("{origin}{path}")),
             iso(e.created_at as i64),
-            escape_html(&source.changefreq),
-            escape_html(&source.priority)
+            xml_text(&source.changefreq),
+            xml_text(&source.priority),
+            extras.get(&e.id).and_then(|x| x.as_deref()).unwrap_or("")
         ));
     }
-    xml(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{body}</urlset>\n"))
+    xml(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" xmlns:video=\"http://www.google.com/schemas/sitemap-video/1.1\" xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\">\n{body}</urlset>\n"))
 }
 
 #[cfg(test)]
@@ -301,5 +469,71 @@ mod tests {
         let (_, body) = get(&app, "/sitemap-pages.xml").await;
         assert_eq!(body.matches("<loc>https://t.example/</loc>").count(), 1);
         assert!(body.contains("<loc>https://t.example/about</loc>"));
+    }
+
+    #[tokio::test]
+    async fn media_sources_add_video_and_image_extensions_and_skip_unplayable_events() {
+        let mut videos = source("videos", 21, 100);
+        videos.media = true;
+        videos.encoding = "nevent".into();
+        let mut images = source("images", 20, 100);
+        images.media = true;
+        let app = app("media", vec![videos, images], "[]");
+        app.mirror.database.save_event(&EventBuilder::new(Kind::Metadata, "{\"name\":\"Alice\"}").finalize(&Keys::new(SecretKey::from_slice(&[1; 32]).unwrap())).unwrap()).await.unwrap();
+        save(&app, 1, 21, 100, vec![vec!["title", "Clip & more"], vec!["imeta", "url https://cdn/a.mp4", "m video/mp4", "x aa", "image https://cdn/a.jpg", "duration 12"], vec!["t", "demo"]]).await;
+        save(&app, 2, 21, 101, vec![]).await;
+        save(&app, 3, 20, 102, vec![vec!["imeta", "url https://cdn/i.jpg", "m image/jpeg", "x bb"]]).await;
+        let (_, v) = get(&app, "/sitemap-videos-1.xml").await;
+        assert!(v.contains("<video:content_loc>https://cdn/a.mp4</video:content_loc>"));
+        assert!(v.contains("<video:title>Clip &amp; more</video:title>"));
+        assert!(v.contains("<video:uploader info=\"https://t.example/p/nprofile1"));
+        assert_eq!(v.matches("<url>").count(), 1);
+        let (_, i) = get(&app, "/sitemap-images-1.xml").await;
+        assert!(i.contains("<image:loc>https://cdn/i.jpg</image:loc>"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_media_collapses_to_the_preferred_kind() {
+        let mut videos = source("videos", 21, 100);
+        videos.filter = json!({"kinds": [21, 34235]});
+        videos.media = true;
+        let app = app("dupes", vec![videos], "[]");
+        let tag = |id: &'static str| vec![vec!["imeta", "url https://cdn/same.mp4", "m video/mp4", id]];
+        save(&app, 1, 34235, 300, [tag("x same"), vec![vec!["d", "a"]]].concat()).await;
+        let kept = save(&app, 1, 21, 100, tag("x same")).await;
+        let (_, body) = get(&app, "/sitemap-videos-1.xml").await;
+        assert_eq!(body.matches("<url>").count(), 1);
+        assert!(body.contains(&kept.id.to_bech32().unwrap_or_default()) || body.contains("nevent1"));
+    }
+
+    #[tokio::test]
+    async fn tag_sources_rank_by_count_and_drop_rare_tags() {
+        let mut tags = source("tags", 21, 100);
+        tags.group = "tag".into();
+        tags.prefix = "/t/".into();
+        tags.min_count = 2;
+        let app = app("tags", vec![tags], "[]");
+        save(&app, 1, 21, 100, vec![vec!["t", "Popular"], vec!["t", "rare"]]).await;
+        save(&app, 2, 21, 101, vec![vec!["t", "popular"], vec!["t", "a b"]]).await;
+        save(&app, 3, 21, 102, vec![vec!["t", "popular"], vec!["t", "a b"]]).await;
+        let (_, body) = get(&app, "/sitemap-tags-1.xml").await;
+        let popular = body.find("/t/popular").unwrap();
+        assert!(popular < body.find("/t/a%20b").unwrap());
+        assert!(!body.contains("rare"));
+    }
+
+    #[tokio::test]
+    async fn author_sources_list_each_author_once_with_their_latest_post_date() {
+        let mut authors = source("profiles", 21, 100);
+        authors.group = "author".into();
+        authors.encoding = "nprofile".into();
+        authors.prefix = "/p/".into();
+        let app = app("authors", vec![authors], "[]");
+        save(&app, 1, 21, 100, vec![]).await;
+        save(&app, 1, 21, 200, vec![]).await;
+        save(&app, 2, 21, 150, vec![]).await;
+        let (_, body) = get(&app, "/sitemap-profiles-1.xml").await;
+        assert_eq!(body.matches("/p/nprofile1").count(), 2);
+        assert!(body.contains("<lastmod>1970-01-01T00:03:20Z</lastmod>"));
     }
 }

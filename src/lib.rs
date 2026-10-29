@@ -6,3 +6,6 @@ pub mod head;
 pub mod mirror;
 pub mod sitemap;
 pub mod web;
+pub mod health;
+pub mod media;
+pub mod sweep;

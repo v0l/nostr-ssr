@@ -113,7 +113,8 @@ async fn resolve_misses(app: &App, misses: &[Value]) -> bool {
 
 async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<(String, u16)> {
     let renderer = app.renderer.as_ref()?;
-    let input = json!({ "url": url }).to_string();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let input = json!({ "url": url, "now": now, "origin": origin }).to_string();
     let mut out = match renderer.call("ssrRender", input.clone()).await {
         Ok(o) => o,
         Err(e) => {

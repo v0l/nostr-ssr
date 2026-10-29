@@ -19,9 +19,26 @@ impl Default for Backfill {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct Health {
+    pub filter: Value,
+    pub interval_secs: u64,
+    pub allow_private: bool,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Health { filter: serde_json::json!({"kinds": [20, 21, 22, 34235, 34236]}), interval_secs: 60, allow_private: false }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SitemapSource {
     pub name: String,
     pub filter: Value,
+    pub group: String,
+    pub media: bool,
+    pub min_count: usize,
     pub prefix: String,
     pub encoding: String,
     pub chunk: Option<usize>,
@@ -35,6 +52,9 @@ impl Default for SitemapSource {
         SitemapSource {
             name: "events".into(),
             filter: Value::Object(Default::default()),
+            group: String::new(),
+            media: false,
+            min_count: 1,
             prefix: "/e/".into(),
             encoding: "nevent".into(),
             chunk: None,
@@ -58,6 +78,7 @@ pub struct Config {
     pub sitemap: Vec<SitemapSource>,
     pub sitemap_ttl_secs: u64,
     pub filters: Vec<Rule>,
+    pub health: Option<Health>,
     pub static_paths: Vec<String>,
     pub max_events: usize,
     pub sitemap_chunk: usize,
@@ -82,6 +103,7 @@ impl Default for Config {
             sitemap: vec![],
             sitemap_ttl_secs: 300,
             filters: vec![],
+            health: None,
             static_paths: vec!["/".into()],
             max_events: 200_000,
             sitemap_chunk: 40_000,
