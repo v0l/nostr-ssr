@@ -46,6 +46,7 @@ fn path_for(source: &SitemapSource, e: &Entry) -> Option<String> {
         return Some(loc.clone());
     }
     let id = match source.encoding.as_str() {
+        "auto" if e.kind.is_addressable() => return path_for(&SitemapSource { encoding: "naddr".into(), ..source.clone() }, e),
         "note" => e.id.to_bech32().ok()?,
         "naddr" => Nip19Coordinate::new(Coordinate::new(e.kind, e.pubkey).identifier(e.identifier.as_deref()?), Vec::<RelayUrl>::new()).to_bech32().ok()?,
         "npub" => e.pubkey.to_bech32().ok()?,
@@ -535,5 +536,17 @@ mod tests {
         let (_, body) = get(&app, "/sitemap-profiles-1.xml").await;
         assert_eq!(body.matches("/p/nprofile1").count(), 2);
         assert!(body.contains("<lastmod>1970-01-01T00:03:20Z</lastmod>"));
+    }
+
+    #[tokio::test]
+    async fn auto_encoding_uses_naddr_for_addressable_kinds_and_nevent_otherwise() {
+        let mut both = source("both", 21, 100);
+        both.filter = json!({"kinds": [21, 34235]});
+        both.encoding = "auto".into();
+        let app = app("auto", vec![both], "[]");
+        save(&app, 1, 34235, 100, vec![vec!["d", "slug"]]).await;
+        save(&app, 2, 21, 101, vec![]).await;
+        let (_, body) = get(&app, "/sitemap-both-1.xml").await;
+        assert!(body.contains("/e/naddr1") && body.contains("/e/nevent1"));
     }
 }
