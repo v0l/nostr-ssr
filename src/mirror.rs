@@ -1,4 +1,5 @@
 use crate::config::{Backfill, Config};
+use crate::filters::{self, ResultFilter};
 use nostr_memory::MemoryDatabase;
 use nostr_relay_builder::LocalRelay;
 use nostr_sdk::prelude::*;
@@ -20,6 +21,7 @@ pub struct Mirror {
     pub relay: LocalRelay,
     client: Client,
     kinds: Vec<Kind>,
+    filters: Arc<Vec<Arc<dyn ResultFilter>>>,
     priority_loaded: Arc<AtomicBool>,
     pending_profiles: Arc<Mutex<HashSet<PublicKey>>>,
     tried: Arc<Mutex<HashMap<String, Instant>>>,
@@ -67,14 +69,20 @@ impl Mirror {
             relay,
             client,
             kinds: kinds.iter().copied().map(Kind::from).collect(),
+            filters: Default::default(),
             priority_loaded: Default::default(),
             pending_profiles: Default::default(),
             tried: Default::default(),
         }
     }
 
-    pub fn from_config(config: &Config) -> Mirror {
-        Mirror::new(config.max_events, config.relay_port, &config.kinds)
+    pub fn from_config(config: &Config) -> anyhow::Result<Mirror> {
+        Ok(Mirror::new(config.max_events, config.relay_port, &config.kinds).with_filters(filters::build(&config.filters)?))
+    }
+
+    pub fn with_filters(mut self, filters: Vec<Arc<dyn ResultFilter>>) -> Mirror {
+        self.filters = Arc::new(filters);
+        self
     }
 
     pub fn priority_loaded(&self) -> bool {
@@ -88,9 +96,12 @@ impl Mirror {
     pub async fn query(&self, raw: &[Value]) -> Vec<Event> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
+        self.filters.iter().for_each(|f| f.prepare());
         for (mut filter, search) in raw.iter().filter_map(parse_filter) {
             let limit = filter.limit;
-            if search.is_some() {
+            let wanted: Option<Vec<Kind>> = filter.kinds.as_ref().map(|k| k.iter().copied().collect());
+            let post_filtered = filters::may_apply(&self.filters, wanted.as_deref());
+            if search.is_some() || post_filtered {
                 filter.limit = None;
             }
             let Ok(events) = self.database.query(filter).await else { continue };
@@ -99,6 +110,9 @@ impl Mirror {
             for ev in events.iter() {
                 if limit.is_some_and(|l| taken >= l) {
                     break;
+                }
+                if post_filtered && !filters::keep_all(&self.filters, ev) {
+                    continue;
                 }
                 if let Some(tokens) = &tokens {
                     let text = search_text(ev);
@@ -350,6 +364,18 @@ mod tests {
         })
         .await
         .expect("profile fetched");
+    }
+
+    #[tokio::test]
+    async fn post_filters_drop_results_before_the_limit_is_applied() {
+        let rule: crate::filters::Rule = serde_json::from_str(r#"{"kinds":[2003],"deny_tags":{"t":["dead"]}}"#).unwrap();
+        let m = Mirror::new(0, None, &[]).with_filters(crate::filters::build(&[rule]).unwrap());
+        for (n, at, tag) in [(1u8, 10u64, "ok"), (2, 11, "dead"), (3, 12, "dead")] {
+            m.database.save_event(&note(n, at, "t", vec![vec!["t", tag]])).await.unwrap();
+        }
+        let got = m.query(&[json!({"kinds": [2003], "limit": 2})]).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].created_at.as_secs(), 10);
     }
 
     #[tokio::test]

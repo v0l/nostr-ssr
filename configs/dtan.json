@@ -7,7 +7,7 @@
     {"filter": {"kinds": [2003]}, "max": 5000, "priority": true},
     {"filter": {"kinds": [1111], "#K": ["2003"]}, "max": 5000, "priority": true}
   ],
-  "sitemap": [{"filter": {"kinds": [2003]}, "prefix": "/e/", "encoding": "nevent"}],
+  "sitemap": [{"name": "torrents", "chunk": 40000, "filter": {"kinds": [2003]}, "prefix": "/e/", "encoding": "nevent"}],
   "static_paths": ["/", "/categories", "/relays"],
   "warm": ["/"]
 }

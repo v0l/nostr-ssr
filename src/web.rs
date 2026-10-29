@@ -1,14 +1,14 @@
 use crate::cache::PageCache;
-use crate::config::{Config, SitemapSource};
+use crate::config::Config;
+use crate::sitemap::Sitemaps;
 use crate::engine::Renderer;
-use crate::head::{assemble, escape_html, head_tags, Head, Site};
+use crate::head::{assemble, head_tags, Head, Site};
 use crate::mirror::{parse_filter, Mirror};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, ToBech32};
 use nostr::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,13 +24,14 @@ pub struct App {
     pub mirror: Mirror,
     pub renderer: Option<Renderer>,
     pub pages: PageCache,
+    pub sitemaps: Sitemaps,
 }
 
 pub type Shared = Arc<App>;
 
 impl App {
     pub fn new(config: Config, mirror: Mirror, renderer: Option<Renderer>) -> Shared {
-        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024) })
+        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default() })
     }
 }
 
@@ -47,9 +48,9 @@ struct Rendered {
 pub fn router(app: Shared) -> Router {
     let assets = ServeDir::new(app.config.client_dir()).append_index_html_on_directories(false);
     Router::new()
-        .route("/sitemap.xml", get(sitemap_index))
-        .route("/sitemap-pages.xml", get(sitemap_pages))
-        .route("/sitemap-events-{file}", get(sitemap_events))
+        .route("/sitemap.xml", get(crate::sitemap::index))
+        .route("/sitemap-pages.xml", get(crate::sitemap::pages))
+        .route("/sitemap-{file}", get(crate::sitemap::file))
         .fallback_service(assets.fallback(get(page).with_state(app.clone())))
         .layer(axum::middleware::map_response(cache_assets))
         .layer(CompressionLayer::new())
@@ -63,7 +64,7 @@ async fn cache_assets(uri: axum::extract::OriginalUri, mut res: Response) -> Res
     res
 }
 
-fn origin(app: &App, headers: &HeaderMap) -> String {
+pub fn origin(app: &App, headers: &HeaderMap) -> String {
     if let Some(u) = &app.config.public_url {
         return u.trim_end_matches('/').to_string();
     }
@@ -179,116 +180,6 @@ pub async fn warm(app: &Shared, paths: &[String]) {
     }
 }
 
-pub fn event_path(source: &SitemapSource, ev: &Event) -> Option<String> {
-    let id = match source.encoding.as_str() {
-        "note" => ev.id.to_bech32().ok()?,
-        "naddr" => {
-            let d = ev.tags.identifier()?;
-            Nip19Coordinate::new(Coordinate::new(ev.kind, ev.pubkey).identifier(d), Vec::<RelayUrl>::new()).to_bech32().ok()?
-        }
-        _ => Nip19Event::new(ev.id).author(ev.pubkey).kind(ev.kind).to_bech32().ok()?,
-    };
-    Some(format!("{}{id}", source.prefix))
-}
-
-type Entry = (String, Option<String>, &'static str, &'static str);
-
-fn xml_response(xml: String) -> Response {
-    ([(header::CONTENT_TYPE, "application/xml; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=300")], xml).into_response()
-}
-
-fn urlset(entries: &[Entry]) -> Response {
-    let body: String = entries
-        .iter()
-        .map(|(loc, lastmod, freq, prio)| {
-            let lm = lastmod.as_ref().map(|l| format!("<lastmod>{l}</lastmod>")).unwrap_or_default();
-            format!("  <url><loc>{}</loc>{lm}<changefreq>{freq}</changefreq><priority>{prio}</priority></url>\n", escape_html(loc))
-        })
-        .collect();
-    xml_response(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{body}</urlset>\n"))
-}
-
-async fn source_events(app: &App, source: &SitemapSource) -> Vec<Event> {
-    let mut all = app.mirror.query(&[source.filter.clone()]).await;
-    all.reverse();
-    all
-}
-
-async fn chunk_counts(app: &App) -> Vec<usize> {
-    let mut counts = Vec::new();
-    for source in &app.config.sitemap {
-        counts.push(app.mirror.count(&source.filter).await);
-    }
-    counts
-}
-
-async fn sitemap_index(State(app): State<Shared>, headers: HeaderMap) -> Response {
-    let origin = origin(&app, &headers);
-    let chunk = app.config.sitemap_chunk.max(1);
-    let files: usize = chunk_counts(&app).await.iter().map(|c| c.div_ceil(chunk)).sum();
-    let mut locs = vec![format!("{origin}/sitemap-pages.xml")];
-    locs.extend((1..=files).map(|n| format!("{origin}/sitemap-events-{n}.xml")));
-    let body: String = locs.iter().map(|l| format!("  <sitemap><loc>{}</loc></sitemap>\n", escape_html(l))).collect();
-    xml_response(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n{body}</sitemapindex>\n"))
-}
-
-async fn sitemap_pages(State(app): State<Shared>, headers: HeaderMap) -> Response {
-    let origin = origin(&app, &headers);
-    let mut paths = app.config.static_paths.clone();
-    if let Some(r) = &app.renderer {
-        for function in ["ssrPaths", "ssrCategories"] {
-            if let Ok(out) = r.call(function, String::new()).await {
-                paths.extend(serde_json::from_str::<Vec<String>>(&out.text).unwrap_or_default());
-                break;
-            }
-        }
-    }
-    paths.dedup();
-    let entries: Vec<Entry> = paths.iter().map(|p| (format!("{origin}{p}"), None, if p == "/" { "hourly" } else { "daily" }, if p == "/" { "1.0" } else { "0.5" })).collect();
-    urlset(&entries)
-}
-
-async fn sitemap_events(State(app): State<Shared>, headers: HeaderMap, Path(file): Path<String>) -> Response {
-    let Some(n) = file.strip_suffix(".xml").and_then(|n| n.parse::<usize>().ok()).filter(|n| *n >= 1) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let origin = origin(&app, &headers);
-    let chunk = app.config.sitemap_chunk.max(1);
-    let mut first = (n - 1) * chunk;
-    for (source, count) in app.config.sitemap.iter().zip(chunk_counts(&app).await) {
-        let files = count.div_ceil(chunk) * chunk;
-        if first >= files {
-            first -= files;
-            continue;
-        }
-        let events = source_events(&app, source).await;
-        let entries: Vec<Entry> = events
-            .iter()
-            .skip(first)
-            .take(chunk)
-            .filter_map(|ev| Some((format!("{origin}{}", event_path(source, ev)?), Some(iso(ev.created_at.as_secs() as i64)), "monthly", "0.7")))
-            .collect();
-        return if entries.is_empty() { StatusCode::NOT_FOUND.into_response() } else { urlset(&entries) };
-    }
-    StatusCode::NOT_FOUND.into_response()
-}
-
-pub fn iso(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,8 +211,8 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
             site_name: "Test".into(),
             public_url: Some("https://t.example".into()),
             dist: PathBuf::from(&dir),
-            sitemap: vec![SitemapSource { filter: json!({"kinds": [1]}), prefix: "/e/".into(), encoding: "note".into() }],
-            sitemap_chunk: 2,
+            sitemap: vec![crate::config::SitemapSource { filter: json!({"kinds": [1]}), encoding: "note".into(), chunk: Some(2), ..Default::default() }],
+            sitemap_ttl_secs: 0,
             ..Config::default()
         };
         let mirror = Mirror::new(0, None, &[]);
@@ -340,12 +231,6 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let ev = EventBuilder::text_note(text).custom_created_at(Timestamp::from_secs(at)).finalize(&keys).unwrap();
         app.mirror.database.save_event(&ev).await.unwrap();
         ev
-    }
-
-    #[test]
-    fn unix_seconds_format_as_utc_iso() {
-        assert_eq!(iso(0), "1970-01-01T00:00:00Z");
-        assert_eq!(iso(1_709_164_800), "2024-02-29T00:00:00Z");
     }
 
     #[tokio::test]
@@ -396,41 +281,11 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
     }
 
     #[tokio::test]
-    async fn the_sitemap_is_chunked_and_lists_event_links_oldest_first() {
-        let app = setup("sitemap", BUNDLE);
-        let mut evs = Vec::new();
-        for n in 1..=3u8 {
-            evs.push(note(&app, n, 1_700_000_000 + n as u64, "x").await);
-        }
-        let (_, index) = get_page(&app, "/sitemap.xml").await;
-        assert!(index.contains("<loc>https://t.example/sitemap-pages.xml</loc>"));
-        assert!(index.contains("sitemap-events-2.xml") && !index.contains("sitemap-events-3.xml"));
-        let (_, pages) = get_page(&app, "/sitemap-pages.xml").await;
-        assert!(pages.contains("<loc>https://t.example/</loc>") && pages.contains("<loc>https://t.example/about</loc>"));
-        let (status, first) = get_page(&app, "/sitemap-events-1.xml").await;
-        assert_eq!(status, 200);
-        assert!(first.contains(&format!("/e/{}", evs[0].id.to_bech32().unwrap())));
-        assert!(first.contains(&format!("/e/{}", evs[1].id.to_bech32().unwrap())));
-        let (_, second) = get_page(&app, "/sitemap-events-2.xml").await;
-        assert!(second.contains(&evs[2].id.to_bech32().unwrap()));
-        assert_eq!(get_page(&app, "/sitemap-events-3.xml").await.0, 404);
-        assert_eq!(get_page(&app, "/sitemap-events-abc.xml").await.0, 404);
-    }
-
-    #[tokio::test]
     async fn the_origin_follows_x_forwarded_proto_when_no_public_url_is_set() {
         let mut app = setup("origin", BUNDLE);
         Arc::get_mut(&mut app).unwrap().config.public_url = None;
         let res = router(app).oneshot(Request::get("/sitemap.xml").header("host", "x.example").header("x-forwarded-proto", "https").body(Body::empty()).unwrap()).await.unwrap();
         let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert!(body.contains("<loc>https://x.example/sitemap-pages.xml</loc>"));
-    }
-
-    #[test]
-    fn addressable_events_link_by_naddr() {
-        let keys = Keys::generate();
-        let ev = EventBuilder::new(Kind::from(30023), "x").tag(Tag::identifier("slug")).finalize(&keys).unwrap();
-        let source = SitemapSource { filter: json!({}), prefix: "/a/".into(), encoding: "naddr".into() };
-        assert!(event_path(&source, &ev).unwrap().starts_with("/a/naddr1"));
     }
 }

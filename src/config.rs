@@ -1,3 +1,4 @@
+use crate::filters::Rule;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -19,14 +20,28 @@ impl Default for Backfill {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SitemapSource {
+    pub name: String,
     pub filter: Value,
     pub prefix: String,
     pub encoding: String,
+    pub chunk: Option<usize>,
+    pub max: Option<usize>,
+    pub changefreq: String,
+    pub priority: String,
 }
 
 impl Default for SitemapSource {
     fn default() -> Self {
-        SitemapSource { filter: Value::Object(Default::default()), prefix: "/e/".into(), encoding: "nevent".into() }
+        SitemapSource {
+            name: "events".into(),
+            filter: Value::Object(Default::default()),
+            prefix: "/e/".into(),
+            encoding: "nevent".into(),
+            chunk: None,
+            max: None,
+            changefreq: "monthly".into(),
+            priority: "0.7".into(),
+        }
     }
 }
 
@@ -41,6 +56,8 @@ pub struct Config {
     pub kinds: Vec<u16>,
     pub backfill: Vec<Backfill>,
     pub sitemap: Vec<SitemapSource>,
+    pub sitemap_ttl_secs: u64,
+    pub filters: Vec<Rule>,
     pub static_paths: Vec<String>,
     pub max_events: usize,
     pub sitemap_chunk: usize,
@@ -63,9 +80,11 @@ impl Default for Config {
             kinds: vec![],
             backfill: vec![],
             sitemap: vec![],
+            sitemap_ttl_secs: 300,
+            filters: vec![],
             static_paths: vec!["/".into()],
             max_events: 200_000,
-            sitemap_chunk: 10_000,
+            sitemap_chunk: 40_000,
             dist: "dist".into(),
             bundle: None,
             bind: "0.0.0.0:3000".into(),

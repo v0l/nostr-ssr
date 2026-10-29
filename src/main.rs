@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Config::load()?;
 
-    let mirror = Mirror::from_config(&config);
+    let mirror = Mirror::from_config(&config)?;
     if config.relay_port.is_some() {
         mirror.relay.run().await?;
         tracing::info!("relay on {}", mirror.relay.url().await);

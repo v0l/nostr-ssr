@@ -1,6 +1,8 @@
 pub mod cache;
 pub mod config;
 pub mod engine;
+pub mod filters;
 pub mod head;
 pub mod mirror;
+pub mod sitemap;
 pub mod web;
