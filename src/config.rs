@@ -1,0 +1,148 @@
+use serde::Deserialize;
+use serde_json::Value;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Backfill {
+    pub filter: Value,
+    pub max: usize,
+    pub priority: bool,
+}
+
+impl Default for Backfill {
+    fn default() -> Self {
+        Backfill { filter: Value::Object(Default::default()), max: 5000, priority: false }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SitemapSource {
+    pub filter: Value,
+    pub prefix: String,
+    pub encoding: String,
+}
+
+impl Default for SitemapSource {
+    fn default() -> Self {
+        SitemapSource { filter: Value::Object(Default::default()), prefix: "/e/".into(), encoding: "nevent".into() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub site_name: String,
+    pub description: String,
+    pub public_url: Option<String>,
+    pub default_image: String,
+    pub relays: Vec<String>,
+    pub kinds: Vec<u16>,
+    pub backfill: Vec<Backfill>,
+    pub sitemap: Vec<SitemapSource>,
+    pub static_paths: Vec<String>,
+    pub max_events: usize,
+    pub sitemap_chunk: usize,
+    pub dist: PathBuf,
+    pub bundle: Option<PathBuf>,
+    pub bind: String,
+    pub relay_port: Option<u16>,
+    pub workers: usize,
+    pub warm: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            site_name: "Nostr".into(),
+            description: String::new(),
+            public_url: None,
+            default_image: "/banner.jpg".into(),
+            relays: vec![],
+            kinds: vec![],
+            backfill: vec![],
+            sitemap: vec![],
+            static_paths: vec!["/".into()],
+            max_events: 200_000,
+            sitemap_chunk: 10_000,
+            dist: "dist".into(),
+            bundle: None,
+            bind: "0.0.0.0:3000".into(),
+            relay_port: None,
+            workers: 2,
+            warm: vec![],
+        }
+    }
+}
+
+impl Config {
+    pub fn load() -> anyhow::Result<Config> {
+        let mut config: Config = match std::env::var("CONFIG") {
+            Ok(path) => serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?)?,
+            Err(_) => Config::default(),
+        };
+        config.apply_env(|k| std::env::var(k).ok());
+        Ok(config)
+    }
+
+    pub fn apply_env(&mut self, get: impl Fn(&str) -> Option<String>) {
+        let text = |k: &str| get(k).filter(|v| !v.is_empty());
+        if let Some(v) = text("SITE_NAME") {
+            self.site_name = v;
+        }
+        if let Some(v) = text("PUBLIC_URL") {
+            self.public_url = Some(v);
+        }
+        if let Some(v) = text("RELAYS") {
+            self.relays = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+        if let Some(v) = text("MAX_EVENTS").and_then(|v| v.parse().ok()) {
+            self.max_events = v;
+        }
+        if let Some(v) = text("DIST") {
+            self.dist = v.into();
+        }
+        if let Some(v) = text("SSR_BUNDLE") {
+            self.bundle = Some(v.into());
+        }
+        if let Some(v) = text("BIND") {
+            self.bind = v;
+        }
+        if let Some(v) = text("RELAY_PORT").and_then(|v| v.parse().ok()) {
+            self.relay_port = Some(v);
+        }
+        if let Some(v) = text("SSR_WORKERS").and_then(|v| v.parse().ok()) {
+            self.workers = v;
+        }
+    }
+
+    pub fn bundle_path(&self) -> PathBuf {
+        self.bundle.clone().unwrap_or_else(|| self.dist.join("ssr/render.js"))
+    }
+
+    pub fn client_dir(&self) -> PathBuf {
+        let nested = self.dist.join("client");
+        if nested.join("index.html").exists() {
+            nested
+        } else {
+            self.dist.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_json_file_keeps_defaults_and_env_overrides_it() {
+        let mut c: Config = serde_json::from_str(r#"{"site_name":"DTAN.XYZ","kinds":[2003],"backfill":[{"filter":{"kinds":[2003]},"priority":true}]}"#).unwrap();
+        assert_eq!(c.max_events, 200_000);
+        assert_eq!(c.backfill[0].max, 5000);
+        assert!(c.backfill[0].priority);
+        c.apply_env(|k| (k == "RELAYS").then(|| "wss://a, wss://b".to_string()));
+        assert_eq!(c.relays, vec!["wss://a", "wss://b"]);
+        assert_eq!(c.site_name, "DTAN.XYZ");
+    }
+}
