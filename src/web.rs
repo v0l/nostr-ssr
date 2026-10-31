@@ -169,7 +169,16 @@ async fn shell_with_tags(app: &App, origin: &str, shell_html: &str, url: &str) -
     Some(assemble_raw(shell_html, "", &head, &json!({})))
 }
 
+fn own_shell(app: &App, url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let rule = app.config.shells.iter().find(|r| path.starts_with(&r.prefix))?;
+    std::fs::read_to_string(app.config.client_dir().join(&rule.file)).ok()
+}
+
 pub async fn page_for(app: Shared, headers: HeaderMap, url: String) -> Response {
+    if let Some(own) = own_shell(&app, &url) {
+        return html(200, own);
+    }
     let Some(shell_html) = shell(&app) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "client build missing").into_response();
     };
@@ -335,6 +344,21 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let (status, body) = get_page(&app, "/").await;
         assert_eq!(status, 200);
         assert!(body.contains("<div id=\"root\"></div>"));
+    }
+
+    #[tokio::test]
+    async fn a_path_with_its_own_shell_gets_that_shell_without_server_rendering() {
+        let mut app = setup("shells", BUNDLE);
+        let dir = app.config.client_dir();
+        std::fs::write(dir.join("overlay.html"), "<html><head><title>Overlay</title></head><body><div id=\"overlay\"></div></body></html>").unwrap();
+        note(&app, 1, 1_700_000_000, "hello relay").await;
+        Arc::get_mut(&mut app).unwrap().config.shells = vec![crate::config::ShellRule { prefix: "/overlay/".into(), file: "overlay.html".into() }];
+        let (status, body) = get_page(&app, "/overlay/abc/zaps?volume=1").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("<div id=\"overlay\"></div>"));
+        assert!(!body.contains("hello relay") && !body.contains("<div id=\"root\">"));
+        let (_, main) = get_page(&app, "/").await;
+        assert!(main.contains("<p>hello relay</p>"));
     }
 
     #[tokio::test]

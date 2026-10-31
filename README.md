@@ -81,6 +81,13 @@ and address paths, so a plain SPA (snort) gets per-event previews without writin
 relay stream and backfills, so the mirror only holds what pages fetch on demand. `headers` adds response headers by path prefix
 (for example a Content-Security-Policy that nginx used to set).
 
+`shells` serves a different client HTML file for a path prefix, as is and without rendering, for a light entry point
+that should not load the main app (an OBS overlay, an embed):
+
+```json
+"shells": [{"prefix": "/overlay/", "file": "overlay.html"}]
+```
+
 Routes: pages, `/sitemap.xml`, `/sitemap-pages.xml`, `/sitemap-NAME-N.xml`, static client assets.
 
 Test: `cargo test`. Run: `CONFIG=configs/dtan.json DIST=../dtan/dist cargo run`.

@@ -37,6 +37,13 @@ impl Default for ProxyRule {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct ShellRule {
+    pub prefix: String,
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct HeaderRule {
     pub prefix: String,
     pub set: std::collections::HashMap<String, String>,
@@ -134,6 +141,7 @@ pub struct Config {
     pub proxy: Vec<ProxyRule>,
     pub opengraph: Option<OpenGraph>,
     pub headers: Vec<HeaderRule>,
+    pub shells: Vec<ShellRule>,
     pub static_paths: Vec<String>,
     pub max_events: usize,
     pub sitemap_chunk: usize,
@@ -163,6 +171,7 @@ impl Default for Config {
             proxy: vec![],
             opengraph: None,
             headers: vec![],
+            shells: vec![],
             static_paths: vec!["/".into()],
             max_events: 200_000,
             sitemap_chunk: 40_000,
