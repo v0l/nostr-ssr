@@ -8,6 +8,8 @@ use axum::response::{IntoResponse, Response};
 use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, Nip19Profile, ToBech32};
 use nostr::prelude::*;
 use std::sync::Arc;
+
+const MAX_CLOCK_SKEW_SECS: u64 = 600;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -122,6 +124,8 @@ async fn collect(app: &crate::web::App, source: &SitemapSource) -> SourceSnapsho
         obj.insert("limit".into(), max.into());
     }
     let mut events = app.mirror.query(&[filter]).await;
+    let latest = Timestamp::now() + MAX_CLOCK_SKEW_SECS;
+    events.retain(|ev| ev.created_at <= latest);
     if source.media {
         events = deduplicated(events);
     }
@@ -372,6 +376,19 @@ mod tests {
 
     fn source(name: &str, kind: u16, chunk: usize) -> SitemapSource {
         SitemapSource { name: name.into(), filter: json!({"kinds": [kind]}), chunk: Some(chunk), encoding: "note".into(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn events_dated_in_the_future_are_left_out_so_lastmod_is_never_ahead() {
+        let app = app("future", vec![source("notes", 1, 10)], "[]");
+        let now = Timestamp::now().as_secs();
+        let past = save(&app, 1, 1, now - 60, vec![]).await;
+        let future = save(&app, 2, 1, now + 86_400 * 13, vec![]).await;
+        let (_, index) = get(&app, "/sitemap.xml").await;
+        assert!(index.contains(&format!("<lastmod>{}</lastmod>", iso((now - 60) as i64))), "{index}");
+        let (_, body) = get(&app, "/sitemap-notes-1.xml").await;
+        assert!(body.contains(&past.id.to_bech32().unwrap()));
+        assert!(!body.contains(&future.id.to_bech32().unwrap()));
     }
 
     async fn save(app: &Shared, n: u8, kind: u16, at: u64, tags: Vec<Vec<&str>>) -> Event {
