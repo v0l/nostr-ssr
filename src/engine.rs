@@ -45,6 +45,19 @@ pub fn run_filters(mirror: &Mirror, handle: &tokio::runtime::Handle, filters_jso
     out
 }
 
+const MAX_LOAD_JOBS: usize = 1_000_000;
+
+fn drain_jobs(rt: &Runtime) -> Result<(), String> {
+    for _ in 0..MAX_LOAD_JOBS {
+        match rt.execute_pending_job() {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => return Err(format!("pending job failed: {e:?}")),
+        }
+    }
+    Err("pending jobs never settled".into())
+}
+
 struct Engine {
     _rt: Runtime,
     ctx: Context,
@@ -73,9 +86,10 @@ impl Engine {
                 let detail = ctx.catch().into_exception().map(|x| format!("{x}")).unwrap_or_else(|| e.to_string());
                 format!("loading {}: {detail}", bundle.display())
             })?;
-            ctx.globals().get::<_, Function>("ssrRender").map_err(|_| format!("{} does not define ssrRender", bundle.display()))?;
             Ok::<_, String>(())
         })?;
+        drain_jobs(&rt).map_err(|e| format!("loading {}: {e}", bundle.display()))?;
+        ctx.with(|ctx| ctx.globals().get::<_, Function>("ssrRender").map(|_| ()).map_err(|_| format!("{} does not define ssrRender", bundle.display())))?;
         Ok(Engine { _rt: rt, ctx, loaded: modified(bundle), misses })
     }
 
@@ -193,6 +207,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&path, "globalThis.ssrRender = () => 'fixed';").unwrap();
         assert_eq!(r.call("ssrRender", "x".into()).await.unwrap().text, "fixed");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_can_finish_async_setup_before_its_first_render() {
+        let source = "Promise.resolve('ready').then(v => v + '!').then(v => { globalThis.ssrRender = () => v; });";
+        let r = Renderer::start(bundle("async-setup", source), 1, Mirror::new(0, None, &[]));
+        assert_eq!(r.call("ssrRender", "x".into()).await.unwrap().text, "ready!");
     }
 
     #[tokio::test]
