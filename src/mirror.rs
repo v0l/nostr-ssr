@@ -240,12 +240,13 @@ impl Mirror {
             if let Some(u) = until {
                 filter = filter.until(u);
             }
+            let before = self.len().await;
             let events = self.client.fetch_events(filter).timeout(Duration::from_secs(30)).await?;
             let mut oldest = Timestamp::max();
             for ev in events.iter() {
                 oldest = oldest.min(ev.created_at);
             }
-            if events.len() < PAGE {
+            if events.is_empty() || self.len().await == before {
                 break;
             }
             fetched += events.len();
@@ -360,6 +361,18 @@ mod tests {
         })
         .await
         .expect("live event reached the mirror");
+    }
+
+    #[tokio::test]
+    async fn backfill_keeps_paging_when_the_relay_caps_pages_below_ours() {
+        let upstream = LocalRelay::builder().max_filter_limit(100).build();
+        upstream.run().await.unwrap();
+        for n in 1..=350u64 {
+            upstream.add_event(note(1, 1_000_000 + n, &format!("t{n}"), vec![])).await.unwrap();
+        }
+        let m = Mirror::new(0, None, &[2003]);
+        m.follow(&[upstream.url().await.to_string()], &[backfill(json!({"kinds": [2003]}), true)]).await.unwrap();
+        assert_eq!(m.query(&[json!({"kinds": [2003], "limit": 1000})]).await.len(), 350);
     }
 
     #[tokio::test]
