@@ -11,7 +11,9 @@ mounted into the image at `DIST`. Site behaviour is a JSON file (`CONFIG`, see `
 
 - `globalThis.ssrRender(json)` receives `{"url"}` and returns JSON
   `{html, status, head: {title, description, path, type, image, published, modified, noindex, jsonLd}, data}`.
-  `data` is embedded as `<script id="ssr-data" type="application/json">`.
+  `data` is embedded as `<script id="ssr-data" type="application/json">`. `ssrRender` may return a promise; it is
+  settled from the QuickJS job queue (no timers, no network), and promises left pending when the bundle loads are settled
+  before the first render.
 - `relayQuery(filtersJson) -> eventsJson` is provided natively (NIP-01 filters, plus `search`). Empty results are
   reported as misses; the server fetches them from upstream, then renders again.
 - Optional `ssrPaths()` (or `ssrCategories()`) returns extra sitemap paths.

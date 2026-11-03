@@ -97,10 +97,15 @@ impl Engine {
         self.misses.lock().unwrap().clear();
         let text = self.ctx.with(|ctx| {
             let f: Function = ctx.globals().get(function).map_err(|_| format!("bundle does not define {function}"))?;
-            f.call::<_, String>((input,)).map_err(|e| {
+            let failed = |e: rquickjs::Error| {
                 let detail = ctx.catch().into_exception().map(|x| format!("{x}")).unwrap_or_else(|| e.to_string());
                 format!("{function} failed: {detail}")
-            })
+            };
+            let value: rquickjs::Value = f.call((input,)).map_err(failed)?;
+            match value.as_promise() {
+                Some(promise) => promise.finish::<String>().map_err(failed),
+                None => rquickjs::FromJs::from_js(&ctx, value).map_err(failed),
+            }
         })?;
         Ok(Output { text, misses: std::mem::take(&mut *self.misses.lock().unwrap()) })
     }
@@ -214,6 +219,19 @@ mod tests {
         let source = "Promise.resolve('ready').then(v => v + '!').then(v => { globalThis.ssrRender = () => v; });";
         let r = Renderer::start(bundle("async-setup", source), 1, Mirror::new(0, None, &[]));
         assert_eq!(r.call("ssrRender", "x".into()).await.unwrap().text, "ready!");
+    }
+
+    #[tokio::test]
+    async fn a_render_may_return_a_promise() {
+        let source = "globalThis.ssrRender = async (s) => { const v = await Promise.resolve(s); return v + JSON.parse(relayQuery('[]')).length; };";
+        let r = Renderer::start(bundle("async-render", source), 1, Mirror::new(0, None, &[]));
+        assert_eq!(r.call("ssrRender", "n".into()).await.unwrap().text, "n0");
+    }
+
+    #[tokio::test]
+    async fn a_render_promise_that_never_settles_is_an_error() {
+        let r = Renderer::start(bundle("stuck-render", "globalThis.ssrRender = () => new Promise(() => {});"), 1, Mirror::new(0, None, &[]));
+        assert!(r.call("ssrRender", "x".into()).await.is_err());
     }
 
     #[tokio::test]
