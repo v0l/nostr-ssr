@@ -103,6 +103,8 @@ pub struct SitemapSource {
     pub max: Option<usize>,
     pub changefreq: String,
     pub priority: String,
+    pub family_friendly: Option<bool>,
+    pub view_kind: Option<u16>,
 }
 
 impl Default for SitemapSource {
@@ -119,6 +121,8 @@ impl Default for SitemapSource {
             max: None,
             changefreq: "monthly".into(),
             priority: "0.7".into(),
+            family_friendly: None,
+            view_kind: None,
         }
     }
 }

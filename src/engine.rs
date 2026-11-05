@@ -45,6 +45,13 @@ pub fn run_filters(mirror: &Mirror, handle: &tokio::runtime::Handle, filters_jso
     out
 }
 
+pub fn count_filter(mirror: &Mirror, handle: &tokio::runtime::Handle, filter_json: &str) -> f64 {
+    match serde_json::from_str::<Value>(filter_json) {
+        Ok(filter) => handle.block_on(mirror.count(&filter)) as f64,
+        Err(_) => 0.0,
+    }
+}
+
 const MAX_LOAD_JOBS: usize = 1_000_000;
 
 fn drain_jobs(rt: &Runtime) -> Result<(), String> {
@@ -76,6 +83,10 @@ impl Engine {
         let m = misses.clone();
         ctx.with(|ctx| {
             let hidden_mirror = mirror.clone();
+            let count_mirror = mirror.clone();
+            let count_handle = handle.clone();
+            let count = Function::new(ctx.clone(), move |filter: String| -> f64 { count_filter(&count_mirror, &count_handle, &filter) }).map_err(|e| e.to_string())?;
+            ctx.globals().set("relayCount", count).map_err(|e| e.to_string())?;
             let query = Function::new(ctx.clone(), move |filters: String| -> String { run_filters(&mirror, &handle, &filters, &m) }).map_err(|e| e.to_string())?;
             let hidden = Function::new(ctx.clone(), move || -> String { serde_json::to_string(&hidden_mirror.hidden_keys()).unwrap_or_else(|_| "[]".into()) }).map_err(|e| e.to_string())?;
             ctx.globals().set("relayHidden", hidden).map_err(|e| e.to_string())?;
@@ -185,6 +196,21 @@ mod tests {
         let miss = r.call("ssrRender", json!([{"kinds": [30023]}]).to_string()).await.unwrap();
         assert_eq!(miss.text, "{\"found\":0}");
         assert_eq!(miss.misses, vec![json!({"kinds": [30023]})]);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_counts_mirror_events_through_relay_count() {
+        let mirror = Mirror::new(0, None, &[]);
+        let target = "a".repeat(64);
+        for _ in 0..3 {
+            let keys = nostr::Keys::generate();
+            let ev = nostr::EventBuilder::new(nostr::Kind::Custom(7700), "").tag(nostr::Tag::parse(["e", target.as_str()]).unwrap()).finalize(&keys).unwrap();
+            mirror.database.save_event(&ev).await.unwrap();
+        }
+        let r = Renderer::start(bundle("count", "globalThis.ssrRender = (s) => String(relayCount(s));"), 1, mirror);
+        assert_eq!(r.call("ssrRender", json!({"kinds": [7700], "#e": [target]}).to_string()).await.unwrap().text, "3");
+        assert_eq!(r.call("ssrRender", json!({"kinds": [7700], "#e": ["b".repeat(64)]}).to_string()).await.unwrap().text, "0");
+        assert_eq!(r.call("ssrRender", "not json".into()).await.unwrap().text, "0");
     }
 
     #[tokio::test]

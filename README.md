@@ -16,6 +16,7 @@ mounted into the image at `DIST`. Site behaviour is a JSON file (`CONFIG`, see `
   before the first render.
 - `relayQuery(filtersJson) -> eventsJson` is provided natively (NIP-01 filters, plus `search`). Empty results are
   reported as misses; the server fetches them from upstream, then renders again.
+- `relayCount(filterJson) -> number` counts mirror events matching one filter (0 for a bad filter). It never fetches.
 - Optional `ssrPaths()` (or `ssrCategories()`) returns extra sitemap paths.
 - `hostLog(level, msg)` is provided for `console`.
 
@@ -40,6 +41,10 @@ Each `sitemap` source has its own `name`, `filter`, `prefix`, `encoding` (`neven
 Files are `/sitemap-<name>-<n>.xml`, oldest first, so existing files stay byte-stable as new events arrive and only
 the last file grows. The index carries a `lastmod` per file. The snapshot is built once per `sitemap_ttl_secs` and only
 holds ids, not events, so requests do not re-query the store.
+
+Media sources (`"media": true`) can also set `family_friendly` (`true`/`false`, written as `<video:family_friendly>`)
+and `view_kind`, the kind of view events tagging a video by `e` (or `a` for addressable kinds). Its mirror count is
+written as `<video:view_count>`, so that kind must be in `kinds` and `backfill`.
 
 ## Proxy rules
 

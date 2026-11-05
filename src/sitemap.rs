@@ -237,7 +237,13 @@ fn is_http(u: &str) -> bool {
     u.starts_with("http://") || u.starts_with("https://")
 }
 
-fn video_extra(origin: &str, v: &Media, uploader: Option<(&str, String)>) -> Option<String> {
+struct VideoFacts<'a> {
+    uploader: Option<(&'a str, String)>,
+    family_friendly: Option<bool>,
+    views: Option<usize>,
+}
+
+fn video_extra(origin: &str, v: &Media, facts: VideoFacts) -> Option<String> {
     let thumb = v.thumbnail.as_deref().filter(|t| is_http(t))?;
     if !is_http(&v.url) {
         return None;
@@ -257,7 +263,13 @@ fn video_extra(origin: &str, v: &Media, uploader: Option<(&str, String)>) -> Opt
     for t in v.tags.iter().take(32) {
         out += &format!("      <video:tag>{}</video:tag>\n", xml_text(t));
     }
-    if let Some((name, profile)) = uploader {
+    if let Some(views) = facts.views {
+        out += &format!("      <video:view_count>{views}</video:view_count>\n");
+    }
+    if let Some(ff) = facts.family_friendly {
+        out += &format!("      <video:family_friendly>{}</video:family_friendly>\n", if ff { "yes" } else { "no" });
+    }
+    if let Some((name, profile)) = facts.uploader {
         out += &format!("      <video:uploader info=\"{}\">{}</video:uploader>\n", xml_text(&format!("{origin}{profile}")), xml_text(&clip(name, 100)));
     }
     out += "    </video:video>\n";
@@ -277,12 +289,28 @@ fn image_extra(img: &Media) -> Option<String> {
     Some(urls.iter().take(1000).map(|u| format!("    <image:image>\n      <image:loc>{}</image:loc>\n    </image:image>\n", xml_text(u))).collect())
 }
 
-async fn media_extras(app: &crate::web::App, origin: &str, entries: &[Entry]) -> std::collections::HashMap<EventId, Option<String>> {
+async fn view_counts(app: &crate::web::App, kind: u16, events: &[Event]) -> std::collections::HashMap<EventId, usize> {
+    let mut out = std::collections::HashMap::new();
+    for ev in events {
+        let filter = match ev.tags.identifier().filter(|_| ev.kind.is_addressable()) {
+            Some(d) => serde_json::json!({"kinds": [kind], "#a": [format!("{}:{}:{d}", ev.kind.as_u16(), ev.pubkey.to_hex())]}),
+            None => serde_json::json!({"kinds": [kind], "#e": [ev.id.to_hex()]}),
+        };
+        out.insert(ev.id, app.mirror.count(&filter).await);
+    }
+    out
+}
+
+async fn media_extras(app: &crate::web::App, origin: &str, source: &SitemapSource, entries: &[Entry]) -> std::collections::HashMap<EventId, Option<String>> {
     let ids: Vec<EventId> = entries.iter().map(|e| e.id).collect();
     let events = app.mirror.query(&[serde_json::json!({"ids": ids.iter().map(|i| i.to_hex()).collect::<Vec<_>>()})]).await;
     let parsed: Vec<(EventId, Media)> = events.iter().filter_map(|ev| crate::media::parse(ev).map(|m| (ev.id, m))).collect();
     let pubkeys: Vec<String> = parsed.iter().filter(|(_, m)| !m.is_image()).map(|(_, m)| m.pubkey.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
     let names = profile_names(app, &pubkeys).await;
+    let views = match source.view_kind {
+        Some(kind) => view_counts(app, kind, &events).await,
+        None => Default::default(),
+    };
     parsed
         .into_iter()
         .filter_map(|(id, m)| {
@@ -290,7 +318,7 @@ async fn media_extras(app: &crate::web::App, origin: &str, entries: &[Entry]) ->
                 image_extra(&m)
             } else {
                 let uploader = names.get(&m.pubkey).map(|n| (n.as_str(), crate::media::profile_path_hex(&m.pubkey)));
-                video_extra(origin, &m, uploader)
+                video_extra(origin, &m, VideoFacts { uploader, family_friendly: source.family_friendly, views: source.view_kind.map(|_| views.get(&id).copied().unwrap_or(0)) })
             };
             Some((id, extra))
         })
@@ -323,7 +351,7 @@ pub async fn file(State(app): State<Shared>, headers: HeaderMap, Path(file): Pat
     let Some(entries) = snap.sources.iter().find(|s| s.name == name).and_then(|s| s.entries.chunks(s.chunk).nth(n - 1)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let extras = if source.media { media_extras(&app, &origin, entries).await } else { Default::default() };
+    let extras = if source.media { media_extras(&app, &origin, source, entries).await } else { Default::default() };
     let mut body = String::with_capacity(entries.len() * 160);
     for e in entries {
         let Some(path) = path_for(source, e) else { continue };
@@ -508,6 +536,30 @@ mod tests {
         assert_eq!(v.matches("<url>").count(), 1);
         let (_, i) = get(&app, "/sitemap-images-1.xml").await;
         assert!(i.contains("<image:loc>https://cdn/i.jpg</image:loc>"));
+    }
+
+    #[tokio::test]
+    async fn video_entries_carry_family_friendly_and_view_counts() {
+        let mut videos = source("videos", 21, 100);
+        videos.media = true;
+        videos.encoding = "nevent".into();
+        videos.family_friendly = Some(false);
+        videos.view_kind = Some(7700);
+        let mut plain = source("plain", 22, 100);
+        plain.media = true;
+        let app = app("views", vec![videos, plain], "[]");
+        let watched = save(&app, 1, 21, 100, vec![vec!["imeta", "url https://cdn/w.mp4", "m video/mp4", "x w", "image https://cdn/w.jpg"]]).await;
+        save(&app, 2, 21, 101, vec![vec!["imeta", "url https://cdn/q.mp4", "m video/mp4", "x q", "image https://cdn/q.jpg"]]).await;
+        save(&app, 3, 22, 102, vec![vec!["imeta", "url https://cdn/s.mp4", "m video/mp4", "x s", "image https://cdn/s.jpg"]]).await;
+        for n in 10..13u8 {
+            save(&app, n, 7700, 200, vec![vec!["e", &watched.id.to_hex()]]).await;
+        }
+        let (_, v) = get(&app, "/sitemap-videos-1.xml").await;
+        assert_eq!(v.matches("<video:family_friendly>no</video:family_friendly>").count(), 2, "{v}");
+        assert!(v.contains("<video:view_count>3</video:view_count>"), "{v}");
+        assert!(v.contains("<video:view_count>0</video:view_count>"), "{v}");
+        let (_, p) = get(&app, "/sitemap-plain-1.xml").await;
+        assert!(!p.contains("family_friendly") && !p.contains("view_count"), "{p}");
     }
 
     #[tokio::test]
