@@ -10,7 +10,9 @@ mounted into the image at `DIST`. Site behaviour is a JSON file (`CONFIG`, see `
 ## Bundle contract
 
 - `globalThis.ssrRender(json)` receives `{"url"}` and returns JSON
-  `{html, status, head: {title, description, path, type, image, published, modified, noindex, jsonLd}, data}`.
+  `{html, status, head: {title, description, path, type, image, published, modified, noindex, jsonLd, meta}, data}`.
+  `jsonLd` may be one object or a list (one script each). `meta` is a list of `[name, content]` pairs written after
+  the fixed tags (`og:`, `video:` and `article:` names as `property`), skipping names the fixed tags already set.
   `data` is embedded as `<script id="ssr-data" type="application/json">`. `ssrRender` may return a promise; it is
   settled from the QuickJS job queue (no timers, no network), and promises left pending when the bundle loads are settled
   before the first render.

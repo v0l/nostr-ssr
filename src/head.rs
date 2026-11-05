@@ -17,6 +17,8 @@ pub struct Head {
     pub noindex: Option<bool>,
     pub json_ld: Option<Value>,
     pub raw: Option<String>,
+    #[serde(default)]
+    pub meta: Vec<(String, String)>,
 }
 
 pub struct Site<'a> {
@@ -103,9 +105,23 @@ pub fn head_tags(head: &Head, site: &Site, status: u16) -> String {
             meta(&mut out, "property", "article:modified_time", m);
         }
     }
+    let fixed = overridden(&out.join("\n"));
+    for (name, content) in &head.meta {
+        if content.is_empty() || fixed.iter().any(|n| n == name) {
+            continue;
+        }
+        let kind = if name.starts_with("og:") || name.starts_with("video:") || name.starts_with("article:") { "property" } else { "name" };
+        meta(&mut out, kind, name, content);
+    }
     if !noindex {
         if let Some(ld) = json_ld(head, site, &og_title, description, &kind) {
-            out.push(format!("<script type=\"application/ld+json\">{}</script>", script_json(&ld)));
+            let blocks = match ld {
+                Value::Array(items) => items,
+                one => vec![one],
+            };
+            for block in blocks {
+                out.push(format!("<script type=\"application/ld+json\">{}</script>", script_json(&block)));
+            }
         }
     }
     out.join("\n    ")
@@ -155,7 +171,7 @@ fn stripped_tags() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(concat!(
             r#"[ \t]*(?:<title>[^<]*</title>|"#,
-            r#"<meta\s+(?:name|property)="(?:description|robots|og:[a-z:_]+|article:[a-z_]+|twitter:[a-z:_]+)"[^>]*/?>|"#,
+            r#"<meta\s+(?:name|property)="(?:description|robots|keywords|og:[a-z:_]+|article:[a-z_]+|video:[a-z_]+|twitter:[a-z:_]+)"[^>]*/?>|"#,
             r#"<link\s+rel="canonical"[^>]*/?>)[ \t]*\r?\n?"#
         ))
         .unwrap()
@@ -237,6 +253,31 @@ mod tests {
         assert_eq!(html.matches("id=\"ssr-data\"").count(), 1);
         assert!(!html.contains("</script><b>"));
         assert!(html.contains("<script type=\"module\" src=\"/assets/a.js\"></script>"));
+    }
+
+    #[test]
+    fn extra_meta_from_the_bundle_is_written_and_replaces_the_shell_copy() {
+        let head = Head {
+            path: Some("/e/v".into()),
+            meta: vec![("og:video".into(), "https://cdn/a.mp4".into()), ("video:tag".into(), "a & b".into()), ("keywords".into(), "x, y".into()), ("og:title".into(), "dup".into())],
+            ..Default::default()
+        };
+        let tags = head_tags(&head, &site(), 200);
+        assert!(tags.contains("<meta property=\"og:video\" content=\"https://cdn/a.mp4\" />"), "{tags}");
+        assert!(tags.contains("<meta property=\"video:tag\" content=\"a &amp; b\" />"), "{tags}");
+        assert!(tags.contains("<meta name=\"keywords\" content=\"x, y\" />"), "{tags}");
+        assert_eq!(tags.matches("og:title").count(), 1, "{tags}");
+        let shell = "<html><head><meta name=\"keywords\" content=\"old\" /></head><body><div id=\"root\"></div></body></html>";
+        let html = assemble(shell, "", &tags, &json!({}));
+        assert!(!html.contains("old"), "{html}");
+    }
+
+    #[test]
+    fn a_list_of_json_ld_blocks_is_written_as_one_script_each() {
+        let head = Head { path: Some("/e/v".into()), json_ld: Some(json!([{"@type": "VideoObject", "url": "/e/v"}, {"@type": "BreadcrumbList"}])), ..Default::default() };
+        let tags = head_tags(&head, &site(), 200);
+        assert_eq!(tags.matches("application/ld+json").count(), 2, "{tags}");
+        assert!(tags.contains("\"url\":\"https://dtan.xyz/e/v\""), "{tags}");
     }
 
     #[test]
