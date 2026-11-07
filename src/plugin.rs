@@ -13,11 +13,12 @@ pub struct JsFunction {
 /// Application-side SSR enrichment.
 ///
 /// A plugin registers JS functions the bundle calls during a render
-/// (server-side logic, e.g. answering a torrent tracker announce) and can
-/// add keys to the hydration `data` after a successful render. Bundle keys
-/// always win; plugin keys fill in only where the bundle left them unset.
+/// (server-side logic, e.g. answering a torrent tracker announce), can
+/// add keys to the hydration `data` after a successful render, and can
+/// serve its own HTTP routes under `/api/<name>/`.
 ///
-/// All domain logic lives in the plugin, not in `nostr-ssr`.
+/// Bundle keys always win; plugin keys fill in only where the bundle left
+/// them unset. All domain logic lives in the plugin, not in `nostr-ssr`.
 pub trait Plugin: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -28,6 +29,11 @@ pub trait Plugin: Send + Sync {
     fn enrich(&self, url: &str, status: u16, data: &Value) -> Option<Value> {
         let _ = (url, status, data);
         None
+    }
+
+    /// Stateless routes, served under `/api/<name>/`.
+    fn routes(&self) -> axum::Router {
+        axum::Router::new()
     }
 }
 

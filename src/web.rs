@@ -1,5 +1,6 @@
 use crate::cache::PageCache;
 use crate::config::Config;
+use crate::plugin::Plugin;
 use crate::sitemap::Sitemaps;
 use crate::engine::Renderer;
 use crate::head::{assemble, assemble_raw, head_tags, Head, Site};
@@ -12,7 +13,7 @@ use axum::Router;
 use nostr::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc};
 use std::time::Duration;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
@@ -27,13 +28,18 @@ pub struct App {
     pub sitemaps: Sitemaps,
     pub proxy: crate::proxy::Proxy,
     pub opengraph: crate::opengraph::State,
+    pub plugins: Vec<Arc<dyn Plugin>>,
 }
 
 pub type Shared = Arc<App>;
 
 impl App {
     pub fn new(config: Config, mirror: Mirror, renderer: Option<Renderer>) -> Shared {
-        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default(), proxy: Default::default(), opengraph: Default::default() })
+        Self::with_plugins(config, mirror, renderer, vec![])
+    }
+
+    pub fn with_plugins(config: Config, mirror: Mirror, renderer: Option<Renderer>, plugins: Vec<Arc<dyn Plugin>>) -> Shared {
+        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default(), proxy: Default::default(), opengraph: Default::default(), plugins })
     }
 }
 
@@ -49,15 +55,27 @@ struct Rendered {
 
 pub fn router(app: Shared) -> Router {
     let assets = ServeDir::new(app.config.client_dir()).append_index_html_on_directories(false);
-    crate::proxy::routes(&app.config.proxy)
+    let base = crate::proxy::routes(&app.config.proxy)
         .route("/sitemap.xml", get(crate::sitemap::index))
         .route("/sitemap-pages.xml", get(crate::sitemap::pages))
-        .route("/sitemap-{file}", get(crate::sitemap::file))
-        .fallback_service(assets.fallback(get(page).with_state(app.clone())))
+        .route("/sitemap-{file}", get(crate::sitemap::file));
+    let base = for_plugin_routes(base, &app.plugins);
+    base.fallback_service(assets.fallback(get(page).with_state(app.clone())))
         .layer(axum::middleware::from_fn_with_state(app.clone(), custom_headers))
         .layer(axum::middleware::map_response(cache_assets))
         .layer(CompressionLayer::new())
         .with_state(app)
+}
+
+fn for_plugin_routes(mut base: Router<Shared>, plugins: &[Arc<dyn Plugin>]) -> Router<Shared> {
+    for p in plugins {
+        let name = p.name().to_string();
+        let r = p.routes();
+        if r.has_routes() {
+            base = base.nest_service(&format!("/api/{name}"), r);
+        }
+    }
+    base
 }
 
 async fn custom_headers(State(app): State<Shared>, req: Request, next: axum::middleware::Next) -> Response {
@@ -262,6 +280,16 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         App::new(config, mirror, Some(renderer))
     }
 
+    struct RoutePlugin;
+    impl crate::plugin::Plugin for RoutePlugin {
+        fn name(&self) -> &'static str {
+            "swarm"
+        }
+        fn routes(&self) -> Router {
+            Router::new().route("/stats", get(|| async { axum::Json(json!({ "seeds": 7 })) }))
+        }
+    }
+
     async fn get_page(app: &Shared, uri: &str) -> (u16, String) {
         let res = router(app.clone()).oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
         let status = res.status().as_u16();
@@ -344,6 +372,22 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let (status, body) = get_page(&app, "/").await;
         assert_eq!(status, 200);
         assert!(body.contains("<div id=\"root\"></div>"));
+    }
+
+    #[tokio::test]
+    async fn plugin_routes_are_served_under_the_api_prefix() {
+        let mut app = setup("routes", BUNDLE);
+        Arc::get_mut(&mut app).unwrap().plugins = vec![std::sync::Arc::new(RoutePlugin)];
+        let res = router(app.clone()).oneshot(Request::get("/api/swarm/stats").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert_eq!(body, r#"{"seeds":7}"#);
+        let res = router(app.clone()).oneshot(Request::get("/api/other/x").body(Body::empty()).unwrap()).await.unwrap();
+        // unknown api paths fall through to the SPA shell
+        let status = res.status();
+        let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.contains("id=\"root\""));
     }
 
     #[tokio::test]

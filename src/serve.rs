@@ -27,10 +27,10 @@ pub async fn serve(config: Config, plugins: Vec<Arc<dyn Plugin>>) -> anyhow::Res
         tracing::info!(events, "initial sync complete");
     });
 
-    let renderer = config.bundle_path().exists().then(|| Renderer::start_with_plugins(config.bundle_path(), config.workers, mirror.clone(), plugins));
+    let renderer = config.bundle_path().exists().then(|| Renderer::start_with_plugins(config.bundle_path(), config.workers, mirror.clone(), plugins.clone()));
     let bind = config.bind.clone();
     let warm = config.warm.clone();
-    let app = crate::web::App::new(config, mirror, renderer);
+    let app = crate::web::App::with_plugins(config, mirror, renderer, plugins);
     if !warm.is_empty() {
         let app = app.clone();
         tokio::spawn(async move {
