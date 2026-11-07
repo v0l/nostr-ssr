@@ -1,4 +1,5 @@
 use crate::mirror::Mirror;
+use crate::plugin::{enrich_data, Plugin};
 use rquickjs::{Context, Function, Runtime};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -73,7 +74,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn load(bundle: &Path, mirror: Mirror, handle: tokio::runtime::Handle) -> Result<Engine, String> {
+    fn load(bundle: &Path, mirror: Mirror, handle: tokio::runtime::Handle, plugins: &[Arc<dyn Plugin>]) -> Result<Engine, String> {
         let source = std::fs::read_to_string(bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
         let rt = Runtime::new().map_err(|e| e.to_string())?;
         rt.set_memory_limit(MEMORY_LIMIT);
@@ -93,6 +94,17 @@ impl Engine {
             ctx.globals().set("relayQuery", query).map_err(|e| e.to_string())?;
             let log = Function::new(ctx.clone(), |level: String, msg: String| tracing::warn!("ssr {level}: {msg}")).map_err(|e| e.to_string())?;
             ctx.globals().set("hostLog", log).map_err(|e| e.to_string())?;
+            for p in plugins {
+                for f in p.js_functions() {
+                    let (name, handler) = (f.name, f.handler.clone());
+                    let already = ctx.globals().get::<_, Function>(name).is_ok();
+                    if already {
+                        continue;
+                    }
+                    let fn_ = Function::new(ctx.clone(), move |arg: String| handler(&arg)).map_err(|e| e.to_string())?;
+                    ctx.globals().set(name, fn_).map_err(|e| e.to_string())?;
+                }
+            }
             ctx.eval::<(), _>(source.as_str()).map_err(|e| {
                 let detail = ctx.catch().into_exception().map(|x| format!("{x}")).unwrap_or_else(|| e.to_string());
                 format!("loading {}: {detail}", bundle.display())
@@ -104,8 +116,12 @@ impl Engine {
         Ok(Engine { _rt: rt, ctx, loaded: modified(bundle), misses })
     }
 
-    fn run(&self, function: &str, input: &str) -> Result<Output, String> {
+    fn run(&self, function: &str, input: &str, plugins: &[Arc<dyn Plugin>]) -> Result<Output, String> {
         self.misses.lock().unwrap().clear();
+        let url: String = serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .and_then(|v| v.get("url").and_then(serde_json::Value::as_str).map(String::from))
+            .unwrap_or_default();
         let text = self.ctx.with(|ctx| {
             let f: Function = ctx.globals().get(function).map_err(|_| format!("bundle does not define {function}"))?;
             let failed = |e: rquickjs::Error| {
@@ -118,12 +134,47 @@ impl Engine {
                 None => rquickjs::FromJs::from_js(&ctx, value).map_err(failed),
             }
         })?;
-        Ok(Output { text, misses: std::mem::take(&mut *self.misses.lock().unwrap()) })
+        let data = if function == "ssrRender" && !plugins.is_empty() {
+            render_data(&text, &url, plugins)?
+        } else {
+            text
+        };
+        Ok(Output { text: data, misses: std::mem::take(&mut *self.misses.lock().unwrap()) })
     }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Rendered {
+    #[serde(default)]
+    html: serde_json::Value,
+    #[serde(default = "default_status")]
+    status: u16,
+    data: serde_json::Value,
+    #[serde(flatten)]
+    rest: serde_json::Value,
+}
+
+fn default_status() -> u16 {
+    200
+}
+
+fn render_data(text: &str, url: &str, plugins: &[Arc<dyn Plugin>]) -> Result<String, String> {
+    if plugins.is_empty() {
+        return Ok(text.to_string());
+    }
+    let mut r: Rendered = serde_json::from_str(text).map_err(|e| format!("render output: {e}"))?;
+    if r.data.is_object() {
+        enrich_data(&mut r.data, url, r.status, plugins);
+    }
+    serde_json::to_string(&r).map_err(|e| e.to_string())
 }
 
 impl Renderer {
     pub fn start(bundle: PathBuf, workers: usize, mirror: Mirror) -> Renderer {
+        Self::start_with_plugins(bundle, workers, mirror, vec![])
+    }
+
+    pub fn start_with_plugins(bundle: PathBuf, workers: usize, mirror: Mirror, plugins: Vec<Arc<dyn Plugin>>) -> Renderer {
         let handle = tokio::runtime::Handle::current();
         let (tx, rx) = mpsc::sync_channel::<Job>(64);
         let rx = Arc::new(Mutex::new(rx));
@@ -132,6 +183,7 @@ impl Renderer {
             let bundle = bundle.clone();
             let mirror = mirror.clone();
             let handle = handle.clone();
+            let plugins = plugins.clone();
             std::thread::Builder::new()
                 .name(format!("ssr-{n}"))
                 .spawn(move || {
@@ -142,7 +194,7 @@ impl Renderer {
                             Err(_) => return,
                         };
                         if engine.as_ref().map(|e| e.loaded != modified(&bundle)).unwrap_or(true) {
-                            engine = match Engine::load(&bundle, mirror.clone(), handle.clone()) {
+                            engine = match Engine::load(&bundle, mirror.clone(), handle.clone(), &plugins) {
                                 Ok(e) => Some(e),
                                 Err(e) => {
                                     let _ = job.reply.send(Err(e));
@@ -150,7 +202,7 @@ impl Renderer {
                                 }
                             };
                         }
-                        let result = engine.as_ref().map(|e| e.run(job.function, &job.input)).unwrap_or_else(|| Err("no engine".into()));
+                        let result = engine.as_ref().map(|e| e.run(job.function, &job.input, &plugins)).unwrap_or_else(|| Err("no engine".into()));
                         if result.is_err() {
                             engine = None;
                         }
@@ -172,6 +224,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::{JsFunction, Plugin};
     use nostr::event::FinalizeEvent;
     use nostr_database::NostrDatabase;
     use serde_json::json;
@@ -180,6 +233,30 @@ mod tests {
         let path = std::env::temp_dir().join(format!("nostr-ssr-{name}-{}.js", std::process::id()));
         std::fs::write(&path, source).unwrap();
         path
+    }
+
+    struct TestPlugin;
+    impl Plugin for TestPlugin {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn js_functions(&self) -> Vec<JsFunction> {
+            vec![JsFunction {
+                name: "swarmStats",
+                handler: std::sync::Arc::new(|arg: &str| {
+                    let v: serde_json::Value = serde_json::from_str(arg).unwrap_or_default();
+                    let ih = v.get("info_hash").and_then(serde_json::Value::as_str).unwrap_or("");
+                    json!({ "seeds": ih.len(), "leeches": ih.len() / 2 }).to_string()
+                }),
+            }]
+        }
+        fn enrich(&self, _: &str, _: u16, data: &serde_json::Value) -> Option<serde_json::Value> {
+            if data.get("fromPlugin").is_none() {
+                Some(json!({ "fromPlugin": true }))
+            } else {
+                None
+            }
+        }
     }
 
     #[tokio::test]
@@ -258,6 +335,30 @@ mod tests {
     async fn a_render_promise_that_never_settles_is_an_error() {
         let r = Renderer::start(bundle("stuck-render", "globalThis.ssrRender = () => new Promise(() => {});"), 1, Mirror::new(0, None, &[]));
         assert!(r.call("ssrRender", "x".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn plugins_expose_js_functions_and_enrich_the_hydration_data() {
+        let mirror = Mirror::new(0, None, &[]);
+        let path = bundle("plugin", r#"
+globalThis.ssrRender = (json) => {
+  const { url } = JSON.parse(json);
+  if (url.startsWith("/e/")) {
+    const swarm = JSON.parse(swarmStats(JSON.stringify({ info_hash: "abc123" })));
+    return JSON.stringify({ html: "<div>" + swarm.seeds + "s" + swarm.leeches + "l</div>", status: 200, head: { title: "T" }, data: { queries: {} } });
+  }
+  return JSON.stringify({ html: "<p>home</p>", status: 200, head: { title: "H" }, data: { queries: {} } });
+};
+"#);
+        let r = Renderer::start_with_plugins(path, 1, mirror, vec![std::sync::Arc::new(TestPlugin)]);
+        let home = r.call("ssrRender", json!({ "url": "/", "now": 0, "origin": "https://x" }).to_string()).await.unwrap();
+        let hd: serde_json::Value = serde_json::from_str(&home.text).unwrap();
+        assert_eq!(hd["html"], "<p>home</p>");
+        let e = r.call("ssrRender", json!({ "url": "/e/nevent1abc", "now": 0, "origin": "https://x" }).to_string()).await.unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&e.text).unwrap();
+        assert_eq!(ev["data"]["queries"], json!({}));
+        assert_eq!(ev["data"]["fromPlugin"], true);
+        assert!(ev["html"].as_str().unwrap().contains("6s3l"));
     }
 
     #[tokio::test]

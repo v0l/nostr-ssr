@@ -4,6 +4,8 @@ pub mod engine;
 pub mod filters;
 pub mod head;
 pub mod mirror;
+pub mod plugin;
+pub mod serve;
 pub mod sitemap;
 pub mod web;
 pub mod health;
