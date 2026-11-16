@@ -64,7 +64,29 @@ pub fn router(app: Shared) -> Router {
         .layer(axum::middleware::from_fn_with_state(app.clone(), custom_headers))
         .layer(axum::middleware::map_response(cache_assets))
         .layer(CompressionLayer::new())
+        .layer(axum::middleware::from_fn_with_state(app.clone(), enforce_host))
         .with_state(app)
+}
+
+/// The outermost layer, so a mismatched Host never reaches a handler: an
+/// origin built from a stranger's Host header lands in canonical links,
+/// og:url and sitemap entries, and the responses carry `Cache-Control:
+/// public` — a cache that keys by URL alone would serve the stranger's
+/// domain as the page's identity for its whole TTL. With `public_url` set
+/// the origin is fixed anyway and this only narrows; with `allowed_hosts`
+/// unset the deployment keeps today's behavior.
+async fn enforce_host(State(app): State<Shared>, req: Request, next: axum::middleware::Next) -> Response {
+    let allowed = &app.config.allowed_hosts;
+    if !allowed.is_empty() {
+        if let Some(host) = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
+            let bare = host.trim().split(':').next().unwrap_or("").trim_end_matches('.').to_lowercase();
+            let known = allowed.iter().any(|a| a.trim_end_matches('.').eq_ignore_ascii_case(&bare));
+            if !known {
+                return (StatusCode::MISDIRECTED_REQUEST, "unknown host").into_response();
+            }
+        }
+    }
+    next.run(req).await
 }
 
 fn for_plugin_routes(mut base: Router<Shared>, plugins: &[Arc<dyn Plugin>]) -> Router<Shared> {
@@ -278,6 +300,36 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let mirror = Mirror::new(0, None, &[]);
         let renderer = Renderer::start(config.bundle_path(), 1, mirror.clone());
         App::new(config, mirror, Some(renderer))
+    }
+
+    fn setup_hosts(name: &str, hosts: &[&str]) -> Shared {
+        let dir = std::env::temp_dir().join(format!("nostr-ssr-web-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("client")).unwrap();
+        std::fs::write(dir.join("client/index.html"), SHELL).unwrap();
+        let config = Config {
+            site_name: "Test".into(),
+            allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            dist: PathBuf::from(&dir),
+            ..Config::default()
+        };
+        let mirror = Mirror::new(0, None, &[]);
+        App::new(config, mirror, None)
+    }
+
+    #[tokio::test]
+    async fn a_foreign_host_header_is_refused_when_allowed_hosts_is_set() {
+        let app = setup_hosts("foreign-host", &["t.example"]);
+        let res = router(app.clone()).oneshot(Request::get("/").header("host", "evil.example").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::MISDIRECTED_REQUEST);
+        let ok = router(app).oneshot(Request::get("/").header("host", "t.example").body(Body::empty()).unwrap()).await.unwrap();
+        assert_ne!(ok.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn host_header_is_still_trusted_when_allowed_hosts_is_unset() {
+        let app = setup_hosts("open-host", &[]);
+        let res = router(app).oneshot(Request::get("/").header("host", "whoever.example").body(Body::empty()).unwrap()).await.unwrap();
+        assert_ne!(res.status(), StatusCode::MISDIRECTED_REQUEST);
     }
 
     struct RoutePlugin;

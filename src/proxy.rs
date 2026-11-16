@@ -48,7 +48,16 @@ fn is_pubkey(s: &str) -> bool {
 
 fn request_host(headers: &HeaderMap) -> String {
     let raw = headers.get("x-forwarded-host").or_else(|| headers.get(header::HOST)).and_then(|h| h.to_str().ok()).unwrap_or("");
-    raw.split(',').next().unwrap_or("").trim().split(':').next().unwrap_or("").to_string()
+    let host = raw.split(',').next().unwrap_or("").trim().split(':').next().unwrap_or("").trim_end_matches('.');
+    // This value is interpolated into upstream header templates ({host}) and
+    // can reach og/canonical origins, so hold it to hostname characters. A
+    // client cannot send control bytes in a header value, but a proxy in
+    // front of this one can pass through whatever it likes.
+    let clean: String = host.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).collect();
+    if clean.is_empty() || clean != host {
+        return "localhost".to_string();
+    }
+    clean
 }
 
 fn with_host(value: &str, host: &str) -> String {
@@ -192,6 +201,22 @@ mod tests {
             resolve_headers: HashMap::from([("X-Proxy-Host".to_string(), "zap.stream".to_string())]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn request_host_holds_hostname_characters_only() {
+        let h = |v: &'static str| {
+            let mut hm = HeaderMap::new();
+            hm.insert("x-forwarded-host", HeaderValue::from_static(v));
+            hm
+        };
+        assert_eq!(request_host(&h("good.example:8080")), "good.example");
+        assert_eq!(request_host(&h("good.example.")), "good.example");
+        assert_eq!(request_host(&h("good.example")), "good.example");
+        // anything a hostname would never contain falls back, rather than
+        // riding into an upstream header template or an og:origin
+        assert_eq!(request_host(&h("b@d.example")), "localhost");
+        assert_eq!(request_host(&h("{host}")), "localhost");
     }
 
     #[tokio::test]

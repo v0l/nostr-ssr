@@ -133,6 +133,13 @@ pub struct Config {
     pub site_name: String,
     pub description: String,
     pub public_url: Option<String>,
+    /// Host names this deployment answers as. When set, a request whose
+    /// Host header is not on the list is refused with 421 before anything
+    /// renders. Without it (and without public_url), the origin used for
+    /// canonical links, og:url and sitemap entries comes straight from the
+    /// client's Host header, so any cache that keys by URL alone can pin
+    /// somebody else's domain onto the metadata of every page for its TTL.
+    pub allowed_hosts: Vec<String>,
     pub default_image: String,
     pub relays: Vec<String>,
     pub live: bool,
@@ -163,6 +170,7 @@ impl Default for Config {
             site_name: "Nostr".into(),
             description: String::new(),
             public_url: None,
+            allowed_hosts: vec![],
             default_image: "/banner.jpg".into(),
             relays: vec![],
             live: true,
@@ -206,6 +214,9 @@ impl Config {
         }
         if let Some(v) = text("PUBLIC_URL") {
             self.public_url = Some(v);
+        }
+        if let Some(v) = text("ALLOWED_HOSTS") {
+            self.allowed_hosts = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
         if let Some(v) = text("RELAYS") {
             self.relays = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
