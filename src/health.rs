@@ -54,7 +54,7 @@ pub struct Health {
 
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || v4.octets()[0] == 0 || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))),
+        IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || v4.octets()[0] == 0 || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])) || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0) || (v4.octets()[0] == 198 && (18..=19).contains(&v4.octets()[1]))),
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return public_ip(IpAddr::V4(v4));
@@ -332,6 +332,10 @@ mod tests {
         assert!(!h.url_alive("http://169.254.169.254/latest/meta-data", Expect::Video).await);
         assert!(!h.url_alive("http://[::1]/x.mp4", Expect::Video).await);
         assert!(!h.url_alive("file:///etc/passwd", Expect::Video).await);
+        // NAT64 gateway block and the benchmark range: not media origins
+        assert!(!h.url_alive("http://192.0.0.9/x.mp4", Expect::Video).await);
+        assert!(!h.url_alive("http://198.18.0.1/x.mp4", Expect::Video).await);
+        assert!(!h.url_alive("http://198.19.255.255/x.mp4", Expect::Video).await);
     }
 
     #[tokio::test]
