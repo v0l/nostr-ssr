@@ -1,0 +1,11 @@
+{
+  "site_name": "Demo",
+  "description": "A nostr-ssr demo",
+  "public_url": "http://localhost:3000",
+  "relays": ["wss://relay.primal.net", "wss://relay.snort.social", "wss://relay.damus.io"],
+  "kinds": [1],
+  "backfill": [{"filter": {"kinds": [1]}, "max": 200, "priority": true}],
+  "static_paths": ["/"],
+  "warm": ["/"],
+  "dist": "/app/dist"
+}

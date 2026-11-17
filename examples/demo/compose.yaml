@@ -1,0 +1,14 @@
+services:
+  web:
+    image: voidic/nostr-ssr:latest
+    ports:
+      - "3000:3000"
+    environment:
+      CONFIG: /app/config.json
+      MAX_EVENTS: "100000"
+      SSR_WORKERS: "2"
+    volumes:
+      - ./dist:/app/dist:ro
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
+    mem_limit: 1g
