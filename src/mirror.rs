@@ -188,7 +188,20 @@ impl Mirror {
 
     pub async fn fetch(&self, filters: Vec<Filter>, timeout: Duration) -> usize {
         let before = self.len().await;
-        let _ = self.client.fetch_events(filters).timeout(timeout).await;
+        let mut wanted: Vec<(Filter, usize)> = filters.iter().map(|f| (f.clone(), 0)).collect();
+        let Ok(mut stream) = self.client.stream_events(filters).timeout(timeout).await else { return 0 };
+        while let Some((_, result)) = stream.next().await {
+            let Ok(ev) = result else { continue };
+            let _ = self.database.save_event(&ev).await;
+            for (f, n) in wanted.iter_mut() {
+                if f.match_event(&ev, nostr::filter::MatchEventOptions::new()) {
+                    *n += 1;
+                }
+            }
+            if wanted.iter().all(|(f, n)| satisfied(f, *n)) {
+                break;
+            }
+        }
         self.len().await.saturating_sub(before)
     }
 
@@ -274,6 +287,13 @@ impl Mirror {
             }
         }
     }
+}
+
+fn satisfied(filter: &Filter, found: usize) -> bool {
+    if let Some(ids) = &filter.ids {
+        return found >= ids.len();
+    }
+    filter.limit.is_some_and(|l| found >= l)
 }
 
 async fn forward_to_relay(mirror: Mirror) {
@@ -428,6 +448,38 @@ mod tests {
         upstream.add_event(note(1, Timestamp::now().as_secs(), "live", vec![])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(m.len().await, 1);
+    }
+
+    #[derive(Debug)]
+    struct Stall;
+    impl nostr_relay_builder::builder::QueryPolicy for Stall {
+        fn admit_query<'a>(&'a self, _: &'a mut Filter, _: &'a std::net::SocketAddr) -> BoxedFuture<'a, nostr_relay_builder::builder::QueryPolicyResult> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                nostr_relay_builder::builder::QueryPolicyResult::Accept
+            })
+        }
+    }
+
+    async fn silent_relay() -> String {
+        let relay = LocalRelay::builder().query_policy(Stall).build();
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        std::mem::forget(relay);
+        url
+    }
+
+    #[tokio::test]
+    async fn a_lookup_returns_once_a_relay_has_every_wanted_event_without_waiting_for_slow_relays() {
+        let upstream = MockRelay::run().await.unwrap();
+        let ev = note(1, 100, "wanted", vec![]);
+        upstream.add_event(ev.clone()).await.unwrap();
+        let m = Mirror::new(0, None, &[]);
+        m.follow_with(&[upstream.url().await.to_string(), silent_relay().await], &[], false).await.unwrap();
+        let started = Instant::now();
+        let got = m.fetch(vec![Filter::new().id(ev.id)], Duration::from_secs(3)).await;
+        assert_eq!(got, 1);
+        assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
     }
 
     #[tokio::test]
