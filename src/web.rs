@@ -40,7 +40,8 @@ impl App {
     }
 
     pub fn with_plugins(config: Config, mirror: Mirror, renderer: Option<Renderer>, plugins: Vec<Arc<dyn Plugin>>) -> Shared {
-        Arc::new(App { config, mirror, renderer, pages: PageCache::new(Duration::from_secs(30), Duration::from_secs(900), 96 * 1024 * 1024), sitemaps: Sitemaps::default(), proxy: Default::default(), opengraph: Default::default(), plugins })
+        let pages = PageCache::new(Duration::from_secs(30), Duration::from_secs(900), config.cache_max_mb << 20);
+        Arc::new(App { config, mirror, renderer, pages, sitemaps: Sitemaps::default(), proxy: Default::default(), opengraph: Default::default(), plugins })
     }
 }
 
@@ -70,8 +71,20 @@ pub fn router(app: Shared) -> Router {
 }
 
 async fn healthz(State(app): State<Shared>) -> Response {
-    let body = json!({ "ok": true, "loaded": app.mirror.priority_loaded(), "cached_pages": app.pages.len() });
+    let body = json!({
+        "ok": true,
+        "loaded": app.mirror.priority_loaded(),
+        "cached_pages": app.pages.len(),
+        "cached_bytes": app.pages.bytes(),
+        "rss_bytes": rss_bytes(),
+        "backed_off_relays": app.mirror.backed_off().into_iter().map(|(u, left)| json!({ "url": u, "secs": left.as_secs() })).collect::<Vec<_>>(),
+    });
     ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response()
+}
+
+fn rss_bytes() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024
 }
 
 fn for_plugin_routes(mut base: Router<Shared>, plugins: &[Arc<dyn Plugin>]) -> Router<Shared> {
@@ -458,6 +471,7 @@ globalThis.ssrRender = (json) => {
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
+        assert!(v["rss_bytes"].as_u64().unwrap() > 0);
         for t in busy {
             t.abort();
         }

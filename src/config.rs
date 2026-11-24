@@ -154,6 +154,11 @@ pub struct Config {
     pub bind: String,
     pub relay_port: Option<u16>,
     pub workers: usize,
+    pub render_queue: usize,
+    pub render_wait_ms: u64,
+    pub renders_per_engine: usize,
+    pub engine_heap_mb: usize,
+    pub cache_max_mb: usize,
     pub warm: Vec<String>,
 }
 
@@ -184,6 +189,11 @@ impl Default for Config {
             bind: "0.0.0.0:3000".into(),
             relay_port: None,
             workers: 2,
+            render_queue: 32,
+            render_wait_ms: 2000,
+            renders_per_engine: 2000,
+            engine_heap_mb: 96,
+            cache_max_mb: 64,
             warm: vec![],
         }
     }
@@ -228,6 +238,19 @@ impl Config {
         if let Some(v) = text("SSR_WORKERS").and_then(|v| v.parse().ok()) {
             self.workers = v;
         }
+        if let Some(v) = text("CACHE_MAX_MB").and_then(|v| v.parse().ok()) {
+            self.cache_max_mb = v;
+        }
+    }
+
+    pub fn render_limits(&self) -> crate::engine::Limits {
+        crate::engine::Limits {
+            workers: self.workers,
+            queue: self.render_queue,
+            wait: std::time::Duration::from_millis(self.render_wait_ms),
+            renders_per_engine: self.renders_per_engine,
+            heap_limit: self.engine_heap_mb << 20,
+        }
     }
 
     pub fn bundle_path(&self) -> PathBuf {
@@ -257,5 +280,18 @@ mod tests {
         c.apply_env(|k| (k == "RELAYS").then(|| "wss://a, wss://b".to_string()));
         assert_eq!(c.relays, vec!["wss://a", "wss://b"]);
         assert_eq!(c.site_name, "DTAN.XYZ");
+    }
+
+    #[test]
+    fn render_and_cache_limits_have_bounded_defaults_and_can_be_set() {
+        let c = Config::default();
+        let l = c.render_limits();
+        assert_eq!((l.workers, l.queue, l.wait.as_millis(), l.renders_per_engine, l.heap_limit), (2, 32, 2000, 2000, 96 << 20));
+        assert_eq!(c.cache_max_mb, 64);
+        let mut c: Config = serde_json::from_str(r#"{"workers":3,"render_queue":8,"render_wait_ms":500,"renders_per_engine":100,"engine_heap_mb":64,"cache_max_mb":32}"#).unwrap();
+        let l = c.render_limits();
+        assert_eq!((l.workers, l.queue, l.wait.as_millis(), l.renders_per_engine, l.heap_limit), (3, 8, 500, 100, 64 << 20));
+        c.apply_env(|k| (k == "CACHE_MAX_MB").then(|| "16".to_string()));
+        assert_eq!(c.cache_max_mb, 16);
     }
 }

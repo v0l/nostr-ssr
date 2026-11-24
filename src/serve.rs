@@ -29,7 +29,7 @@ pub async fn serve(config: Config, plugins: Vec<Arc<dyn Plugin>>) -> anyhow::Res
         tracing::info!(events, "initial sync complete");
     });
 
-    let renderer = config.bundle_path().exists().then(|| Renderer::start_with_plugins(config.bundle_path(), config.workers, mirror.clone(), plugins.clone()));
+    let renderer = config.bundle_path().exists().then(|| Renderer::start_with(config.bundle_path(), config.render_limits(), mirror.clone(), plugins.clone()));
     let bind = config.bind.clone();
     let warm = config.warm.clone();
     let app = crate::web::App::with_plugins(config, mirror, renderer, plugins);
