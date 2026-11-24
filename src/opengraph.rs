@@ -73,19 +73,20 @@ pub fn parse_address(name: &str, domain: &str) -> Option<(String, String)> {
     Some((name, domain))
 }
 
-async fn lookup(mirror: &Mirror, filter: Value, key: &str) -> Vec<Event> {
+async fn lookup(mirror: &Mirror, filter: Value, key: &str, deadline: Instant) -> Vec<Event> {
     let found = mirror.query(std::slice::from_ref(&filter)).await;
-    if !found.is_empty() || !mirror.should_try(key) {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if !found.is_empty() || left.is_zero() || !mirror.should_try(key) {
         return found;
     }
     if let Some((f, _)) = parse_filter(&filter) {
-        mirror.fetch(vec![f], FETCH_TIMEOUT).await;
+        mirror.fetch(vec![f], left).await;
     }
     mirror.query(&[filter]).await
 }
 
-async fn profile(mirror: &Mirror, pubkey: &PublicKey) -> Option<Profile> {
-    let ev = lookup(mirror, json!({"kinds": [0], "authors": [pubkey.to_hex()], "limit": 1}), &format!("og-profile:{pubkey}")).await.into_iter().next()?;
+async fn profile(mirror: &Mirror, pubkey: &PublicKey, deadline: Instant) -> Option<Profile> {
+    let ev = lookup(mirror, json!({"kinds": [0], "authors": [pubkey.to_hex()], "limit": 1}), &format!("og-profile:{pubkey}"), deadline).await.into_iter().next()?;
     let v: Value = serde_json::from_str(&ev.content).ok()?;
     let text = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     Some(Profile { name: text("name"), about: text("about"), picture: text("picture") })
@@ -196,7 +197,7 @@ fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
 }
 
-pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &str) -> Tags {
+pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &str, deadline: Instant) -> Tags {
     let mut tags = match ev.kind.as_u16() {
         30311 => {
             let host = ev
@@ -208,15 +209,15 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
                 })
                 .and_then(|t| t.as_slice().get(1).and_then(|h| PublicKey::from_hex(h).ok()))
                 .unwrap_or(ev.pubkey);
-            let p = profile(mirror, &host).await;
+            let p = profile(mirror, &host, deadline).await;
             live_tags(og, ev, p.as_ref(), &host)
         }
         1313 => {
-            let p = profile(mirror, &ev.pubkey).await;
+            let p = profile(mirror, &ev.pubkey, deadline).await;
             clip_tags(og, ev, p.as_ref())
         }
         _ => {
-            let p = profile(mirror, &ev.pubkey).await;
+            let p = profile(mirror, &ev.pubkey, deadline).await;
             post_tags(og, ev, p.as_ref())
         }
     };
@@ -256,6 +257,10 @@ impl State {
 }
 
 pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &str, origin: &str) -> Option<Tags> {
+    tags_within(state, config, mirror, path, origin, Instant::now() + FETCH_TIMEOUT).await
+}
+
+pub async fn tags_within(state: &State, config: &Config, mirror: &Mirror, path: &str, origin: &str, deadline: Instant) -> Option<Tags> {
     let og = config.opengraph.as_ref()?;
     let id = last_segment(path)?;
     let bare = path.split(['?', '#']).next().unwrap_or("");
@@ -271,8 +276,8 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
         Nip19::from_bech32(id).ok()?
     };
     match target {
-        Nip19::Pubkey(pk) => Some(profile_tags(og, &pk, profile(mirror, &pk).await.as_ref())),
-        Nip19::Profile(p) => Some(profile_tags(og, &p.public_key, profile(mirror, &p.public_key).await.as_ref())),
+        Nip19::Pubkey(pk) => Some(profile_tags(og, &pk, profile(mirror, &pk, deadline).await.as_ref())),
+        Nip19::Profile(p) => Some(profile_tags(og, &p.public_key, profile(mirror, &p.public_key, deadline).await.as_ref())),
         Nip19::EventId(_) | Nip19::Event(_) | Nip19::Coordinate(_) => {
             let (filter, key) = match &target {
                 Nip19::EventId(i) => (json!({"ids": [i.to_hex()]}), i.to_hex()),
@@ -280,8 +285,8 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
                 Nip19::Coordinate(c) => (json!({"kinds": [c.kind.as_u16()], "authors": [c.public_key.to_hex()], "#d": [c.identifier]}), format!("{}:{}:{}", c.kind.as_u16(), c.public_key, c.identifier)),
                 _ => return None,
             };
-            let ev = lookup(mirror, filter, &format!("og-event:{key}")).await.into_iter().next()?;
-            Some(event_tags(og, mirror, &ev, origin).await)
+            let ev = lookup(mirror, filter, &format!("og-event:{key}"), deadline).await.into_iter().next()?;
+            Some(event_tags(og, mirror, &ev, origin, deadline).await)
         }
         _ => None,
     }
@@ -357,7 +362,7 @@ mod tests {
         let host = keys(2);
         save(&m, &profile_event(2, r#"{"name":"alice","picture":"https://x/a.png"}"#)).await;
         let ev = event(1, 30311, "", vec![vec!["d", "room"], vec!["title", "Late show"], vec!["streaming", "https://cdn/live.m3u8"], vec!["image", "https://x/cover.png"], vec!["p", &host.public_key().to_hex(), "", "Host"]]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", Instant::now() + FETCH_TIMEOUT).await;
         assert_eq!(meta(&t, "og:type"), Some("video.other"));
         assert_eq!(meta(&t, "og:title"), Some("alice is streaming"));
         assert_eq!(meta(&t, "og:description"), Some("Late show"));
@@ -377,7 +382,7 @@ mod tests {
     async fn an_ended_stream_falls_back_to_the_recording_and_the_host_avatar_when_there_is_no_image() {
         let m = Mirror::new(0, None, &[]);
         let ev = event(1, 30311, "", vec![vec!["d", "room"], vec!["recording", "https://cdn/rec.m3u8"]]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", Instant::now() + FETCH_TIMEOUT).await;
         assert_eq!(meta(&t, "og:video"), Some("https://cdn/rec.m3u8"));
         assert_eq!(meta(&t, "og:title"), Some("Nostrich is streaming"));
         assert!(meta(&t, "og:image").unwrap().contains(&keys(1).public_key().to_hex()));
@@ -388,7 +393,7 @@ mod tests {
         let m = Mirror::new(0, None, &[]);
         save(&m, &profile_event(1, r#"{"name":"bob"}"#)).await;
         let ev = event(1, 1313, "", vec![vec!["r", "https://cdn/clip.mp4"], vec!["title", "Big moment"]]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", Instant::now() + FETCH_TIMEOUT).await;
         assert_eq!(meta(&t, "og:title"), Some("bob created a clip"));
         assert_eq!(meta(&t, "og:video"), Some("https://cdn/clip.mp4"));
         assert_eq!(meta(&t, "og:video:type"), Some("video/mp4"));
@@ -402,7 +407,7 @@ mod tests {
         let m = Mirror::new(0, None, &[]);
         save(&m, &profile_event(1, r#"{"name":"carol","picture":"https://x/c.png"}"#)).await;
         let ev = event(1, 1, &"x".repeat(300), vec![]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", Instant::now() + FETCH_TIMEOUT).await;
         assert_eq!(meta(&t, "og:type"), Some("article"));
         assert_eq!(meta(&t, "og:title").unwrap().chars().count(), "carol: ".len() + 160);
         assert_eq!(meta(&t, "og:image"), Some("https://x/c.png"));

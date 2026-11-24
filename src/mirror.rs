@@ -307,7 +307,7 @@ async fn forward_to_relay(mirror: Mirror) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use nostr_relay_builder::MockRelay;
     use serde_json::json;
@@ -461,7 +461,7 @@ mod tests {
         }
     }
 
-    async fn silent_relay() -> String {
+    pub async fn silent_relay() -> String {
         let relay = LocalRelay::builder().query_policy(Stall).build();
         relay.run().await.unwrap();
         let url = relay.url().await.to_string();

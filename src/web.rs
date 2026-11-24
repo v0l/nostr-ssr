@@ -135,7 +135,7 @@ async fn page(State(app): State<Shared>, headers: HeaderMap, req: Request) -> Re
     page_for(app, headers, url).await
 }
 
-async fn resolve_misses(app: &App, misses: &[Value]) -> bool {
+async fn resolve_misses(app: &App, misses: &[Value], deadline: std::time::Instant) -> bool {
     let mut blocking = Vec::new();
     for m in misses.iter().filter(|m| m.get("search").is_none()) {
         let only_profiles = m.get("kinds").and_then(Value::as_array).is_some_and(|k| k == &[json!(0)]);
@@ -149,11 +149,13 @@ async fn resolve_misses(app: &App, misses: &[Value]) -> bool {
             }
         }
     }
-    !blocking.is_empty() && app.mirror.fetch(blocking, ON_DEMAND_TIMEOUT).await > 0
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    !blocking.is_empty() && !left.is_zero() && app.mirror.fetch(blocking, left).await > 0
 }
 
 async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Outcome {
     let Some(renderer) = app.renderer.as_ref() else { return Outcome::Failed };
+    let deadline = std::time::Instant::now() + ON_DEMAND_TIMEOUT;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let input = json!({ "url": url, "now": now, "origin": origin }).to_string();
     let mut out = match renderer.call("ssrRender", input.clone()).await {
@@ -164,7 +166,7 @@ async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Outcome
             return Outcome::Failed;
         }
     };
-    if !out.misses.is_empty() && resolve_misses(app, &out.misses).await {
+    if !out.misses.is_empty() && resolve_misses(app, &out.misses, deadline).await {
         match renderer.call("ssrRender", input).await {
             Ok(o) => out = o,
             Err(e) => tracing::warn!("re-render {url}: {e}"),
@@ -180,7 +182,7 @@ async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Outcome
     let site = Site { name: &app.config.site_name, description: &app.config.description, default_image: &app.config.default_image, origin };
     let mut tags = head_tags(&rendered.head, &site, rendered.status);
     if rendered.status < 400 {
-        if let Some(og) = crate::opengraph::tags_for(&app.opengraph, &app.config, &app.mirror, url, origin).await {
+        if let Some(og) = crate::opengraph::tags_within(&app.opengraph, &app.config, &app.mirror, url, origin, deadline).await {
             tags = crate::opengraph::merge(&tags, &og);
         }
     }
@@ -519,6 +521,21 @@ globalThis.ssrRender = (json) => {
         for t in busy {
             t.abort();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_page_missing_from_every_relay_waits_for_relays_once_not_once_per_lookup() {
+        let bundle = "globalThis.ssrRender = (json) => { const { url } = JSON.parse(json); const id = url.split('/').pop(); relayQuery(JSON.stringify([{ ids: [id] }])); return JSON.stringify({ html: '<p>x</p>', status: 200, head: {}, data: {} }); };";
+        let mut app = setup("budget", bundle);
+        Arc::get_mut(&mut app).unwrap().config.opengraph = Some(crate::config::OpenGraph::default());
+        app.mirror.follow_with(&[crate::mirror::tests::silent_relay().await], &[], false).await.unwrap();
+        let keys = Keys::new(SecretKey::from_slice(&[9; 32]).unwrap());
+        let ghost = EventBuilder::text_note("never mirrored").finalize(&keys).unwrap();
+        let started = std::time::Instant::now();
+        let (status, _) = get_page(&app, &format!("/{}", ghost.id.to_bech32().unwrap())).await;
+        assert_eq!(status, 200);
+        let took = started.elapsed();
+        assert!(took < ON_DEMAND_TIMEOUT + Duration::from_millis(800), "took {took:?}");
     }
 
     #[tokio::test]
