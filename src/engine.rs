@@ -33,11 +33,13 @@ pub struct Limits {
     pub workers: usize,
     pub queue: usize,
     pub wait: Duration,
+    pub renders_per_engine: usize,
+    pub heap_limit: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { workers: 2, queue: 64, wait: Duration::from_millis(2000) }
+        Limits { workers: 2, queue: 64, wait: Duration::from_millis(2000), renders_per_engine: 2000, heap_limit: 96 << 20 }
     }
 }
 
@@ -98,10 +100,11 @@ fn drain_jobs(rt: &Runtime) -> Result<(), String> {
 }
 
 struct Engine {
-    _rt: Runtime,
+    rt: Runtime,
     ctx: Context,
     loaded: Option<SystemTime>,
     misses: Arc<Mutex<Vec<Value>>>,
+    renders: usize,
 }
 
 impl Engine {
@@ -144,7 +147,16 @@ impl Engine {
         })?;
         drain_jobs(&rt).map_err(|e| format!("loading {}: {e}", bundle.display()))?;
         ctx.with(|ctx| ctx.globals().get::<_, Function>("ssrRender").map(|_| ()).map_err(|_| format!("{} does not define ssrRender", bundle.display())))?;
-        Ok(Engine { _rt: rt, ctx, loaded: modified(bundle), misses })
+        Ok(Engine { rt, ctx, loaded: modified(bundle), misses, renders: 0 })
+    }
+
+    fn worn_out(&mut self, limits: &Limits) -> bool {
+        self.renders += 1;
+        if limits.renders_per_engine > 0 && self.renders >= limits.renders_per_engine {
+            return true;
+        }
+        self.rt.run_gc();
+        limits.heap_limit > 0 && self.rt.memory_usage().memory_used_size as usize > limits.heap_limit
     }
 
     fn run(&self, function: &str, input: &str, plugins: &[Arc<dyn Plugin>]) -> Result<Output, String> {
@@ -219,6 +231,7 @@ impl Renderer {
             let mirror = mirror.clone();
             let handle = handle.clone();
             let plugins = plugins.clone();
+            let limits = limits.clone();
             std::thread::Builder::new()
                 .name(format!("ssr-{n}"))
                 .spawn(move || {
@@ -240,8 +253,8 @@ impl Renderer {
                                 }
                             };
                         }
-                        let result = engine.as_ref().map(|e| e.run(job.function, &job.input, &plugins)).unwrap_or_else(|| Err("no engine".into()));
-                        if result.is_err() {
+                        let result = engine.as_mut().map(|e| e.run(job.function, &job.input, &plugins)).unwrap_or_else(|| Err("no engine".into()));
+                        if result.is_err() || engine.as_mut().is_some_and(|e| e.worn_out(&limits)) {
                             engine = None;
                         }
                         let _ = job.reply.send(result);
@@ -468,6 +481,34 @@ globalThis.ssrRender = (json) => {
         abandoned.abort();
         assert_eq!(first.await.unwrap().unwrap().text, "1");
         assert_eq!(r.call("ssrRender", "c".into()).await.unwrap().text, "2");
+    }
+
+    #[tokio::test]
+    async fn a_worker_reloads_its_engine_after_its_render_budget_and_keeps_rendering_correctly() {
+        let path = bundle("recycle", "globalThis.n = 0; globalThis.ssrRender = (s) => { globalThis.n++; return s + ':' + globalThis.n + ':' + JSON.parse(relayQuery('[{\"kinds\":[1]}]')).length; };");
+        let mirror = Mirror::new(0, None, &[]);
+        let ev = nostr::EventBuilder::text_note("x").finalize(&nostr::Keys::generate()).unwrap();
+        mirror.database.save_event(&ev).await.unwrap();
+        let r = Renderer::start_with(path, Limits { workers: 1, renders_per_engine: 3, ..Limits::default() }, mirror, vec![]);
+        let got: Vec<String> = futures_text(&r, 7).await;
+        assert_eq!(got, vec!["0:1:1", "1:2:1", "2:3:1", "3:1:1", "4:2:1", "5:3:1", "6:1:1"]);
+    }
+
+    #[tokio::test]
+    async fn a_worker_reloads_its_engine_when_the_heap_passes_the_threshold() {
+        let path = bundle("heap", "globalThis.keep = []; globalThis.ssrRender = (s) => { globalThis.keep.push('x'.repeat(1 << 20) + s); return String(globalThis.keep.length); };");
+        let r = Renderer::start_with(path, Limits { workers: 1, heap_limit: 8 << 20, ..Limits::default() }, Mirror::new(0, None, &[]), vec![]);
+        let got: Vec<usize> = futures_text(&r, 30).await.iter().map(|t| t.parse().unwrap()).collect();
+        assert!(got.iter().max().unwrap() < &12, "{got:?}");
+        assert!(got.contains(&1) && got[1..].contains(&1), "{got:?}");
+    }
+
+    async fn futures_text(r: &Renderer, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in 0..n {
+            out.push(r.call("ssrRender", i.to_string()).await.unwrap().text);
+        }
+        out
     }
 
     #[tokio::test]

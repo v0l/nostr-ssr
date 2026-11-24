@@ -497,7 +497,7 @@ globalThis.ssrRender = (json) => {
     async fn a_saturated_renderer_sheds_uncached_pages_with_503_and_keeps_serving_cached_ones() {
         let app = setup("shed", SLOW_BUNDLE);
         let config = app.config.clone();
-        let limits = crate::engine::Limits { workers: 1, queue: 1, wait: Duration::from_millis(50) };
+        let limits = crate::engine::Limits { workers: 1, queue: 1, wait: Duration::from_millis(50), ..Default::default() };
         let renderer = crate::engine::Renderer::start_with(config.bundle_path(), limits, app.mirror.clone(), vec![]);
         let app = App::new(config, app.mirror.clone(), Some(renderer));
         app.mirror.mark_loaded();
