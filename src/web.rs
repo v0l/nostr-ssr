@@ -56,6 +56,7 @@ struct Rendered {
 pub fn router(app: Shared) -> Router {
     let assets = ServeDir::new(app.config.client_dir()).append_index_html_on_directories(false);
     let base = crate::proxy::routes(&app.config.proxy)
+        .route("/healthz", get(healthz))
         .route("/sitemap.xml", get(crate::sitemap::index))
         .route("/sitemap-pages.xml", get(crate::sitemap::pages))
         .route("/sitemap-{file}", get(crate::sitemap::file));
@@ -65,6 +66,11 @@ pub fn router(app: Shared) -> Router {
         .layer(axum::middleware::map_response(cache_assets))
         .layer(CompressionLayer::new())
         .with_state(app)
+}
+
+async fn healthz(State(app): State<Shared>) -> Response {
+    let body = json!({ "ok": true, "loaded": app.mirror.priority_loaded(), "cached_pages": app.pages.len() });
+    ([(header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response()
 }
 
 fn for_plugin_routes(mut base: Router<Shared>, plugins: &[Arc<dyn Plugin>]) -> Router<Shared> {
@@ -420,6 +426,34 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         note(&app, 2, 11, "second").await;
         assert!(!get_page(&app, "/").await.1.contains("second"));
         assert!(get_page(&app, "/?fresh=1").await.1.contains("second"));
+    }
+
+    const SLOW_BUNDLE: &str = r#"
+globalThis.ssrRender = (json) => {
+  const until = Date.now() + 200;
+  while (Date.now() < until) {}
+  return JSON.stringify({ html: "<p>slow</p>", status: 200, head: { title: "Slow" }, data: {} });
+};
+"#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_answers_fast_while_every_worker_is_busy_and_the_queue_is_full() {
+        let app = setup("health", SLOW_BUNDLE);
+        let mut busy = Vec::new();
+        for n in 0..80 {
+            let app = app.clone();
+            busy.push(tokio::spawn(async move { get_page(&app, &format!("/p{n}")).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let (status, body) = get_page(&app, "/healthz").await;
+        assert!(started.elapsed() < Duration::from_millis(50), "health took {:?}", started.elapsed());
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        for t in busy {
+            t.abort();
+        }
     }
 
     #[tokio::test]
