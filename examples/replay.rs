@@ -181,17 +181,24 @@ async fn main() {
     let sampler = {
         let counters = counters.clone();
         let (pid, pid_file) = (pid.clone(), pid_file.clone());
+        let (health_client, health_url) = (client.clone(), format!("{target}/healthz"));
         tokio::spawn(async move {
             let begun = Instant::now();
-            println!("min,rss_mib,sent,ok,shed,other,slow_over_1s,avg_ms,max_ms");
+            println!("min,rss_mib,events,cache_mib,sent,ok,shed,other,slow_over_1s,avg_ms,max_ms");
             loop {
+                let health: serde_json::Value = match health_client.get(&health_url).send().await {
+                    Ok(r) => r.json().await.unwrap_or_default(),
+                    Err(_) => serde_json::Value::Null,
+                };
                 let pid = if pid_file.is_empty() { pid.clone() } else { std::fs::read_to_string(&pid_file).unwrap_or_default().trim().to_string() };
                 let sent = counters.sent.load(Ordering::Relaxed);
                 let done = counters.ok.load(Ordering::Relaxed) + counters.shed.load(Ordering::Relaxed) + counters.other.load(Ordering::Relaxed);
                 println!(
-                    "{:.1},{},{},{},{},{},{},{},{}",
+                    "{:.1},{},{},{},{},{},{},{},{},{},{}",
                     begun.elapsed().as_secs_f64() / 60.0,
                     rss_kib(&pid) / 1024,
+                    health["events"].as_u64().map(|v| v.to_string()).unwrap_or_default(),
+                    health["cached_bytes"].as_u64().map(|v| (v >> 20).to_string()).unwrap_or_default(),
                     sent,
                     counters.ok.load(Ordering::Relaxed),
                     counters.shed.load(Ordering::Relaxed),

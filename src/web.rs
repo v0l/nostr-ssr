@@ -74,6 +74,7 @@ async fn healthz(State(app): State<Shared>) -> Response {
     let body = json!({
         "ok": true,
         "loaded": app.mirror.priority_loaded(),
+        "events": app.mirror.len().await,
         "cached_pages": app.pages.len(),
         "cached_bytes": app.pages.bytes(),
         "rss_bytes": rss_bytes(),
@@ -472,6 +473,7 @@ globalThis.ssrRender = (json) => {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert!(v["rss_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(v["events"], 0);
         for t in busy {
             t.abort();
         }
