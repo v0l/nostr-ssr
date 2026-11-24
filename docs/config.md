@@ -18,7 +18,8 @@ These override the file.
 | `BIND` | `bind` | `0.0.0.0:3000` | Listen address |
 | `RELAY_PORT` | `relay_port` | off | Serve the mirror as a relay on this port |
 | `SSR_WORKERS` | `workers` | `2` | QuickJS render threads |
-| `RUST_LOG` | none | `info` | Log level |
+| `CACHE_MAX_MB` | `cache_max_mb` | `64` | Page cache size, see [memory](#memory) |
+| `RUST_LOG` | none | `info` with nostr-sdk subscription noise off | Log level |
 
 ## Example
 
@@ -69,12 +70,17 @@ These override the file.
 | `opengraph` | off | [OpenGraph tags](#opengraph) |
 | `headers` | `[]` | Response headers by path prefix |
 | `shells` | `[]` | Alternate client HTML by path prefix |
-| `dist`, `bundle`, `bind`, `relay_port`, `workers` | see env table | Same as the env vars |
+| `dist`, `bundle`, `bind`, `relay_port`, `workers`, `cache_max_mb` | see env table | Same as the env vars |
+| `render_queue` | `32` | Renders that may wait for a worker. More callers wait `render_wait_ms` for a slot |
+| `render_wait_ms` | `2000` | How long a page waits for a queue slot before it is shed with `503` and `Retry-After: 5` |
+| `renders_per_engine` | `2000` | A worker reloads its QuickJS engine after this many renders. `0` turns it off |
+| `engine_heap_mb` | `96` | A worker reloads its engine when the QuickJS heap passes this after a render. `0` turns it off |
 
 ## Routes
 
 | Route | Served by |
 | --- | --- |
+| `/healthz` | JSON from memory: `ok`, `loaded`, `cached_pages`, `cached_bytes`, `rss_bytes`, `backed_off_relays`. Never renders, so use it for probes |
 | `/sitemap.xml` | Sitemap index: the pages file plus every chunk of every source |
 | `/sitemap-pages.xml` | `static_paths` plus `ssrPaths()` from the bundle |
 | `/sitemap-<name>-<n>.xml` | Chunk `n` (from 1) of a sitemap source |
@@ -82,9 +88,11 @@ These override the file.
 | proxy prefixes | Your `proxy` rules |
 | anything else | A file from `DIST/client`, or a rendered page |
 
-Pages are cached for 30 seconds fresh and 15 minutes stale while revalidating, and only once the mirror is loaded. Requests with a query string are never cached. Files under `/assets/` get a one year immutable cache header. There is no health or metrics route. Probe `/` or `/sitemap.xml`, and read the logs: `initial sync complete events=N` marks the end of the first sync.
+Pages are cached for 30 seconds fresh and 15 minutes stale while revalidating, and only once the mirror is loaded. Requests with a query string are never cached. Concurrent requests for one URL, query string or not, share a single render. Files under `/assets/` get a one year immutable cache header. Probe `/healthz`, not `/`: a page probe waits on render capacity and fails under load. `initial sync complete events=N` in the log marks the end of the first sync.
 
-When a render fails or returns bad JSON the plain client shell is served with status 200, so the SPA still works.
+When a render fails or returns bad JSON the plain client shell is served with status 200, so the SPA still works, and that URL is not rendered again for 30 seconds. When the render queue stays full for `render_wait_ms`, an uncached page gets the plain shell with status 503 and `Retry-After: 5`; a page that is in the cache, even an expired one, is served from it.
+
+A page that reads events the mirror lacks is rendered, the missing events are fetched from the upstream relays, and it is rendered once more. The render worker is free while the fetch runs. All lookups for one page share a 3 second budget, and a lookup by id returns as soon as every id is found. A relay that answers `rate-limited` is skipped for on-demand fetches and backfills for 15 seconds, doubling on each repeat up to 10 minutes, with one log line per backoff.
 
 ## Result filters
 

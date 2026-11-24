@@ -146,8 +146,9 @@ One JSON file, read from `CONFIG`. Every key is optional.
 | `BIND` | `bind` | `0.0.0.0:3000` | Listen address |
 | `RELAY_PORT` | `relay_port` | off | Serve the mirror as a relay on this port |
 | `SSR_WORKERS` | `workers` | `2` | Render threads |
+| `CACHE_MAX_MB` | `cache_max_mb` | `64` | Page cache size |
 
-Everything else (result filters, sitemap options, proxy rules, OpenGraph, headers, extra HTML shells, media health checks) is in [docs/config.md](docs/config.md).
+Everything else (render queue and engine recycling, result filters, sitemap options, proxy rules, OpenGraph, headers, extra HTML shells, media health checks) is in [docs/config.md](docs/config.md).
 
 ## Deploying
 
@@ -171,7 +172,7 @@ services:
 
 On Kubernetes it is a plain Deployment: one container, port 3000, the memory limit below, and an Ingress for your domain. Set `PUBLIC_URL`, or pass `x-forwarded-proto` and `Host` from the proxy, so canonical links and sitemaps use the public address. Use `imagePullPolicy: Always` if you deploy `:latest`, and `kubectl rollout restart` after pushing a new image.
 
-There is no `/health` or metrics route. Use `GET /` or `/sitemap.xml` as the probe, and watch the logs. `RUST_LOG=debug` raises the level. The mirror is in memory, so each pod syncs from the relays on start and serves the plain shell until `initial sync complete` is logged. Run one replica per site, or several that each sync on their own.
+Probe `GET /healthz`: it answers from memory without rendering, so it stays fast when every render worker is busy. It also reports RSS, page cache bytes and relays in rate limit backoff. Do not probe `/`, which renders. `RUST_LOG=debug` raises the level. The mirror is in memory, so each pod syncs from the relays on start and serves the plain shell until `initial sync complete` is logged. Run one replica per site, or several that each sync on their own.
 
 Memory is set mostly by `MAX_EVENTS`. The demo holding about 2500 events sat at 13 MiB. Each render worker may use up to 256 MiB of QuickJS heap and the page cache up to 96 MiB. A site with 300000 events and 2 workers fits in 2 GiB. Measure your own event mix after the first sync and set the limit from that.
 
