@@ -59,6 +59,7 @@ These override the file.
 | `kinds` | `[]` | Kinds followed live |
 | `backfill` | `[]` | List of `{filter, max, priority}`. `max` defaults to 5000 |
 | `max_events` | `200000` | Mirror capacity |
+| `max_event_bytes` | `65536` | Events whose content plus tags are larger are not mirrored. `0` turns it off |
 | `static_paths` | `["/"]` | Paths listed in `/sitemap-pages.xml` |
 | `warm` | `[]` | Paths pre-rendered in the background |
 | `sitemap` | `[]` | Sitemap sources, see [Sitemaps](#sitemaps) |

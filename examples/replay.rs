@@ -100,6 +100,30 @@ async fn main() {
     let pid_file = arg("--pid-file", "");
     let mut rng = Rng(0x9e3779b97f4a7c15);
 
+    if arg("--mirror-only", "") == "1" {
+        let mirror = nostr_ssr::mirror::Mirror::new(events, None, &[]);
+        let authors: Vec<Keys> = (0..4000).map(|_| Keys::generate()).collect();
+        let now = Timestamp::now().as_secs();
+        let mut refs: Vec<(EventId, PublicKey)> = Vec::new();
+        let mut bytes = 0usize;
+        println!("events,rss_mib,json_mib");
+        println!("0,{},0", rss_kib("self") / 1024);
+        for i in 0..events * 2 {
+            let k = &authors[rng.below(authors.len() as u64) as usize];
+            let at = now - (i as u64 * 7) % (86_400 * 30);
+            let ev = if i % 10 == 0 { profile(&mut rng, &Keys::generate(), at) } else { note(&mut rng, k, at, &refs) };
+            if refs.len() < 20_000 {
+                refs.push((ev.id, ev.pubkey));
+            }
+            bytes += ev.as_json().len();
+            let _ = nostr_database::NostrDatabase::save_event(mirror.database.as_ref(), &ev).await;
+            if (i + 1) % (events / 5) == 0 {
+                println!("{},{},{}", mirror.len().await, rss_kib("self") / 1024, bytes >> 20);
+            }
+        }
+        return;
+    }
+
     let relay = LocalRelay::builder().port(port).max_filter_limit(5000).build();
     relay.run().await.unwrap();
     eprintln!("upstream {}", relay.url().await);

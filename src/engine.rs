@@ -153,10 +153,16 @@ impl Engine {
     fn worn_out(&mut self, limits: &Limits) -> bool {
         self.renders += 1;
         if limits.renders_per_engine > 0 && self.renders >= limits.renders_per_engine {
+            tracing::info!(renders = self.renders, heap_mib = self.rt.memory_usage().memory_used_size >> 20, "recycling render engine");
             return true;
         }
         self.rt.run_gc();
-        limits.heap_limit > 0 && self.rt.memory_usage().memory_used_size as usize > limits.heap_limit
+        let used = self.rt.memory_usage().memory_used_size as usize;
+        let over = limits.heap_limit > 0 && used > limits.heap_limit;
+        if over {
+            tracing::info!(renders = self.renders, heap_mib = used >> 20, "recycling render engine over its heap limit");
+        }
+        over
     }
 
     fn run(&self, function: &str, input: &str, plugins: &[Arc<dyn Plugin>]) -> Result<Output, String> {

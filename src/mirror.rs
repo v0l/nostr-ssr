@@ -89,6 +89,10 @@ pub fn parse_filter(raw: &Value) -> Option<(Filter, Option<String>)> {
 
 impl Mirror {
     pub fn new(max_events: usize, relay_port: Option<u16>, kinds: &[u16]) -> Mirror {
+        Mirror::with_limits(max_events, relay_port, kinds, 0)
+    }
+
+    pub fn with_limits(max_events: usize, relay_port: Option<u16>, kinds: &[u16], max_event_bytes: usize) -> Mirror {
         let database = Arc::new(match NonZeroUsize::new(max_events) {
             Some(max) => MemoryDatabase::bounded(max),
             None => MemoryDatabase::unbounded(),
@@ -98,7 +102,7 @@ impl Mirror {
             builder = builder.port(port);
         }
         let relay = builder.build();
-        let client = Client::builder().database(database.clone()).build();
+        let client = Client::builder().database(database.clone()).admit_policy(SizeCap(max_event_bytes)).build();
         Mirror {
             database,
             relay,
@@ -120,7 +124,7 @@ impl Mirror {
     pub fn from_config_with(config: &Config, extra: Vec<Arc<dyn ResultFilter>>) -> anyhow::Result<Mirror> {
         let mut all = filters::build(&config.filters)?;
         all.extend(extra);
-        Ok(Mirror::new(config.max_events, config.relay_port, &config.kinds).with_filters(all))
+        Ok(Mirror::with_limits(config.max_events, config.relay_port, &config.kinds, config.max_event_bytes).with_filters(all))
     }
 
     pub fn with_filters(mut self, filters: Vec<Arc<dyn ResultFilter>>) -> Mirror {
@@ -380,6 +384,16 @@ impl Mirror {
     }
 }
 
+#[derive(Debug)]
+struct SizeCap(usize);
+
+impl AdmitPolicy for SizeCap {
+    fn admit_event<'a>(&'a self, _: &'a RelayUrl, _: &'a SubscriptionId, event: &'a Event) -> BoxedFuture<'a, Result<AdmitStatus, nostr_sdk::error::Error>> {
+        let too_big = self.0 > 0 && event.content.len() + event.tags.iter().map(|t| t.as_slice().iter().map(String::len).sum::<usize>()).sum::<usize>() > self.0;
+        Box::pin(async move { Ok(if too_big { AdmitStatus::rejected("too large") } else { AdmitStatus::Success }) })
+    }
+}
+
 fn satisfied(filter: &Filter, found: usize) -> bool {
     if let Some(ids) = &filter.ids {
         return found >= ids.len();
@@ -636,6 +650,20 @@ pub mod tests {
         b.clear(&url);
         assert!(!b.is_backed_off(&url));
         assert_eq!(b.mark(&url).as_secs(), 15);
+    }
+
+    #[tokio::test]
+    async fn events_larger_than_the_size_cap_are_never_stored() {
+        let upstream = MockRelay::run().await.unwrap();
+        let small = note(1, 100, "small", vec![]);
+        let big = EventBuilder::new(Kind::from(2003), "x".repeat(5000)).custom_created_at(Timestamp::from_secs(101)).finalize(&keys(2)).unwrap();
+        upstream.add_event(small.clone()).await.unwrap();
+        upstream.add_event(big.clone()).await.unwrap();
+        let m = Mirror::with_limits(0, None, &[], 2000);
+        m.follow(&[upstream.url().await.to_string()], &[backfill(json!({"kinds": [2003]}), true)]).await.unwrap();
+        let got = m.query(&[json!({"kinds": [2003]})]).await;
+        assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), vec![small.id]);
+        assert_eq!(m.fetch(vec![Filter::new().id(big.id)], Duration::from_secs(2)).await, 0);
     }
 
     #[tokio::test]
