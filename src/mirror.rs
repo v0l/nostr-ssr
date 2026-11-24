@@ -25,6 +25,41 @@ pub struct Mirror {
     priority_loaded: Arc<AtomicBool>,
     pending_profiles: Arc<Mutex<HashSet<PublicKey>>>,
     tried: Arc<Mutex<HashMap<String, Instant>>>,
+    urls: Arc<Mutex<Vec<RelayUrl>>>,
+    backoff: Backoff,
+}
+
+const BACKOFF_START: Duration = Duration::from_secs(15);
+const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Default)]
+pub struct Backoff {
+    until: Arc<Mutex<HashMap<RelayUrl, (Instant, Duration)>>>,
+}
+
+impl Backoff {
+    pub fn mark(&self, url: &RelayUrl) -> Duration {
+        let mut g = self.until.lock().unwrap();
+        let delay = match g.get(url) {
+            Some((_, last)) => (*last * 2).min(BACKOFF_MAX),
+            None => BACKOFF_START,
+        };
+        g.insert(url.clone(), (Instant::now() + delay, delay));
+        delay
+    }
+
+    pub fn is_backed_off(&self, url: &RelayUrl) -> bool {
+        self.until.lock().unwrap().get(url).is_some_and(|(until, _)| Instant::now() < *until)
+    }
+
+    pub fn clear(&self, url: &RelayUrl) {
+        self.until.lock().unwrap().remove(url);
+    }
+
+    fn active(&self) -> Vec<(String, Duration)> {
+        let now = Instant::now();
+        self.until.lock().unwrap().iter().filter(|(_, (until, _))| *until > now).map(|(u, (until, _))| (u.to_string(), *until - now)).collect()
+    }
 }
 
 pub fn search_tokens(q: &str) -> Vec<String> {
@@ -73,6 +108,8 @@ impl Mirror {
             priority_loaded: Default::default(),
             pending_profiles: Default::default(),
             tried: Default::default(),
+            urls: Default::default(),
+            backoff: Default::default(),
         }
     }
 
@@ -189,9 +226,19 @@ impl Mirror {
     pub async fn fetch(&self, filters: Vec<Filter>, timeout: Duration) -> usize {
         let before = self.len().await;
         let mut wanted: Vec<(Filter, usize)> = filters.iter().map(|f| (f.clone(), 0)).collect();
-        let Ok(mut stream) = self.client.stream_events(filters).timeout(timeout).await else { return 0 };
-        while let Some((_, result)) = stream.next().await {
-            let Ok(ev) = result else { continue };
+        let Some(target) = self.target(filters) else { return 0 };
+        let Ok(mut stream) = self.client.stream_events(target).timeout(timeout).await else { return 0 };
+        while let Some((url, result)) = stream.next().await {
+            let ev = match result {
+                Ok(ev) => {
+                    self.backoff.clear(&url);
+                    ev
+                }
+                Err(e) => {
+                    self.relay_error(&url, &e.to_string());
+                    continue;
+                }
+            };
             let _ = self.database.save_event(&ev).await;
             for (f, n) in wanted.iter_mut() {
                 if f.match_event(&ev, nostr::filter::MatchEventOptions::new()) {
@@ -205,6 +252,46 @@ impl Mirror {
         self.len().await.saturating_sub(before)
     }
 
+    async fn collect(&self, filter: Filter, timeout: Duration) -> Vec<Event> {
+        let mut out = Vec::new();
+        let Some(target) = self.target(vec![filter]) else { return out };
+        let Ok(mut stream) = self.client.stream_events(target).timeout(timeout).await else { return out };
+        while let Some((url, result)) = stream.next().await {
+            match result {
+                Ok(ev) => {
+                    let _ = self.database.save_event(&ev).await;
+                    out.push(ev);
+                }
+                Err(e) => self.relay_error(&url, &e.to_string()),
+            }
+        }
+        out
+    }
+
+    fn target(&self, filters: Vec<Filter>) -> Option<ReqTarget<'static>> {
+        let urls: Vec<RelayUrl> = self.urls.lock().unwrap().iter().filter(|u| !self.backoff.is_backed_off(u)).cloned().collect();
+        if urls.is_empty() {
+            return None;
+        }
+        Some(ReqTarget::manual(urls.into_iter().map(|u| (u, filters.clone()))))
+    }
+
+    fn relay_error(&self, url: &RelayUrl, error: &str) {
+        if !error.contains("rate-limited") {
+            tracing::debug!(%url, error, "relay error");
+            return;
+        }
+        let first = !self.backoff.is_backed_off(url);
+        let delay = self.backoff.mark(url);
+        if first {
+            tracing::warn!(%url, error, secs = delay.as_secs(), "relay rate limited, backing off");
+        }
+    }
+
+    pub fn backed_off(&self) -> Vec<(String, Duration)> {
+        self.backoff.active()
+    }
+
     pub async fn follow(&self, urls: &[String], backfills: &[Backfill]) -> anyhow::Result<()> {
         self.follow_with(urls, backfills, true).await
     }
@@ -216,8 +303,12 @@ impl Mirror {
         }
         for url in urls {
             self.client.add_relay(url.as_str()).await?;
+            if let Ok(u) = RelayUrl::parse(url) {
+                self.urls.lock().unwrap().push(u);
+            }
         }
         self.client.connect().and_wait(Duration::from_secs(15)).await;
+        tokio::spawn(watch_rate_limits(self.clone()));
         if !live {
             let me = self.clone();
             tokio::spawn(async move { me.profile_loop().await });
@@ -254,7 +345,7 @@ impl Mirror {
                 filter = filter.until(u);
             }
             let before = self.len().await;
-            let events = self.client.fetch_events(filter).timeout(Duration::from_secs(30)).await?;
+            let events = self.collect(filter, Duration::from_secs(30)).await;
             let mut oldest = Timestamp::max();
             for ev in events.iter() {
                 oldest = oldest.min(ev.created_at);
@@ -294,6 +385,21 @@ fn satisfied(filter: &Filter, found: usize) -> bool {
         return found >= ids.len();
     }
     filter.limit.is_some_and(|l| found >= l)
+}
+
+async fn watch_rate_limits(mirror: Mirror) {
+    let mut notifications = mirror.client.notifications();
+    while let Some(n) = notifications.next().await {
+        if let ClientNotification::Message { relay_url, message } = n {
+            let text = match message.as_ref() {
+                RelayMessage::Closed { message, .. } => message.to_string(),
+                RelayMessage::Notice(message) => message.to_string(),
+                RelayMessage::Ok { status: false, message, .. } => message.to_string(),
+                _ => continue,
+            };
+            mirror.relay_error(&relay_url, &text);
+        }
+    }
 }
 
 async fn forward_to_relay(mirror: Mirror) {
@@ -480,6 +586,56 @@ pub mod tests {
         let got = m.fetch(vec![Filter::new().id(ev.id)], Duration::from_secs(3)).await;
         assert_eq!(got, 1);
         assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
+    }
+
+    #[derive(Debug, Default)]
+    struct RateLimited(std::sync::atomic::AtomicUsize);
+    impl nostr_relay_builder::builder::QueryPolicy for RateLimited {
+        fn admit_query<'a>(&'a self, _: &'a mut Filter, _: &'a std::net::SocketAddr) -> BoxedFuture<'a, nostr_relay_builder::builder::QueryPolicyResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { nostr_relay_builder::builder::QueryPolicyResult::reject(MachineReadablePrefix::RateLimited, "read bandwidth budget") })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct Shared(Arc<RateLimited>);
+    impl nostr_relay_builder::builder::QueryPolicy for Shared {
+        fn admit_query<'a>(&'a self, f: &'a mut Filter, a: &'a std::net::SocketAddr) -> BoxedFuture<'a, nostr_relay_builder::builder::QueryPolicyResult> {
+            self.0.admit_query(f, a)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_relay_is_backed_off_while_the_others_keep_answering() {
+        let limited = Arc::new(RateLimited::default());
+        let bad = LocalRelay::builder().query_policy(Shared(limited.clone())).build();
+        bad.run().await.unwrap();
+        let good = MockRelay::run().await.unwrap();
+        let m = Mirror::new(0, None, &[]);
+        m.follow_with(&[bad.url().await.to_string(), good.url().await.to_string()], &[], false).await.unwrap();
+        for n in 0..5u8 {
+            let ev = note(n + 1, 100 + n as u64, "wanted", vec![]);
+            good.add_event(ev.clone()).await.unwrap();
+            assert_eq!(m.fetch(vec![Filter::new().id(ev.id)], Duration::from_secs(3)).await, 1);
+        }
+        assert_eq!(limited.0.load(Ordering::SeqCst), 1, "the limited relay was asked again during its backoff");
+        let backed: Vec<String> = m.backed_off().into_iter().map(|(u, _)| u).collect();
+        assert_eq!(backed, vec![bad.url().await.to_string()]);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_ten_minutes_and_clears_on_success() {
+        let b = Backoff::default();
+        let url = RelayUrl::parse("wss://r.example").unwrap();
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            delays.push(b.mark(&url).as_secs());
+        }
+        assert_eq!(delays, vec![15, 30, 60, 120, 240, 480, 600, 600]);
+        assert!(b.is_backed_off(&url));
+        b.clear(&url);
+        assert!(!b.is_backed_off(&url));
+        assert_eq!(b.mark(&url).as_secs(), 15);
     }
 
     #[tokio::test]

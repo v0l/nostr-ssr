@@ -5,6 +5,8 @@ use crate::plugin::Plugin;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub const DEFAULT_LOG_FILTER: &str = "info,nostr_sdk::relay::inner=error,nostr_sdk::client::api::fetch_events=off";
+
 pub async fn serve(config: Config, plugins: Vec<Arc<dyn Plugin>>) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -47,4 +49,18 @@ pub async fn serve(config: Config, plugins: Vec<Arc<dyn Plugin>>) -> anyhow::Res
     tracing::info!("listening on {bind}");
     axum::serve(listener, crate::web::router(app)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_log_filter_drops_relay_subscription_timeout_warnings_but_keeps_ours() {
+        let filter = tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER);
+        let text = filter.to_string();
+        assert!(text.contains("nostr_sdk::relay::inner=error"), "{text}");
+        assert!(text.contains("nostr_sdk::client::api::fetch_events=off"), "{text}");
+        assert!(text.starts_with("info") || text.contains(",info") || text.contains("info,"), "{text}");
+    }
 }
