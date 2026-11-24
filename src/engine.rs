@@ -4,7 +4,7 @@ use rquickjs::{Context, Function, Runtime};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 const STACK_LIMIT: usize = 4 * 1024 * 1024;
@@ -13,6 +13,7 @@ struct Job {
     function: &'static str,
     input: String,
     reply: tokio::sync::oneshot::Sender<Result<Output, String>>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 pub struct Output {
@@ -23,6 +24,36 @@ pub struct Output {
 #[derive(Clone)]
 pub struct Renderer {
     tx: mpsc::SyncSender<Job>,
+    slots: Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub workers: usize,
+    pub queue: usize,
+    pub wait: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { workers: 2, queue: 64, wait: Duration::from_millis(2000) }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum CallError {
+    Busy,
+    Failed(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Busy => write!(f, "renderer busy"),
+            CallError::Failed(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -173,10 +204,16 @@ impl Renderer {
     }
 
     pub fn start_with_plugins(bundle: PathBuf, workers: usize, mirror: Mirror, plugins: Vec<Arc<dyn Plugin>>) -> Renderer {
+        Self::start_with(bundle, Limits { workers, ..Limits::default() }, mirror, plugins)
+    }
+
+    pub fn start_with(bundle: PathBuf, limits: Limits, mirror: Mirror, plugins: Vec<Arc<dyn Plugin>>) -> Renderer {
         let handle = tokio::runtime::Handle::current();
-        let (tx, rx) = mpsc::sync_channel::<Job>(64);
+        let workers = limits.workers.max(1);
+        let capacity = workers + limits.queue;
+        let (tx, rx) = mpsc::sync_channel::<Job>(capacity);
         let rx = Arc::new(Mutex::new(rx));
-        for n in 0..workers.max(1) {
+        for n in 0..workers {
             let rx = rx.clone();
             let bundle = bundle.clone();
             let mirror = mirror.clone();
@@ -191,6 +228,9 @@ impl Renderer {
                             Ok(j) => j,
                             Err(_) => return,
                         };
+                        if job.reply.is_closed() {
+                            continue;
+                        }
                         if engine.as_ref().map(|e| e.loaded != modified(&bundle)).unwrap_or(true) {
                             engine = match Engine::load(&bundle, mirror.clone(), handle.clone(), &plugins) {
                                 Ok(e) => Some(e),
@@ -209,13 +249,17 @@ impl Renderer {
                 })
                 .expect("spawn ssr worker");
         }
-        Renderer { tx }
+        Renderer { tx, slots: Arc::new(tokio::sync::Semaphore::new(capacity)), wait: limits.wait }
     }
 
-    pub async fn call(&self, function: &'static str, input: String) -> Result<Output, String> {
+    pub async fn call(&self, function: &'static str, input: String) -> Result<Output, CallError> {
+        let slot = match tokio::time::timeout(self.wait, self.slots.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            _ => return Err(CallError::Busy),
+        };
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.try_send(Job { function, input, reply }).map_err(|e| format!("renderer busy: {e}"))?;
-        rx.await.map_err(|e| e.to_string())?
+        self.tx.try_send(Job { function, input, reply, _slot: slot }).map_err(|_| CallError::Busy)?;
+        rx.await.map_err(|e| CallError::Failed(e.to_string()))?.map_err(CallError::Failed)
     }
 }
 
@@ -308,7 +352,7 @@ mod tests {
     async fn a_throwing_bundle_names_the_error_and_recovers_when_fixed() {
         let path = bundle("throws", "globalThis.ssrRender = () => { throw new Error('boom'); };");
         let r = Renderer::start(path.clone(), 1, Mirror::new(0, None, &[]));
-        let err = r.call("ssrRender", "x".into()).await.err().unwrap();
+        let err = r.call("ssrRender", "x".into()).await.err().unwrap().to_string();
         assert!(err.contains("boom"), "{err}");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&path, "globalThis.ssrRender = () => 'fixed';").unwrap();
@@ -367,6 +411,63 @@ globalThis.ssrRender = (json) => {
         let v: serde_json::Value = serde_json::from_str(&out.text).unwrap();
         assert_eq!(v["html"], "<p>x</p>");
         assert!(v.get("data").is_none());
+    }
+
+    const SPIN: &str = "globalThis.ssrRender = (s) => { const until = Date.now() + 300; while (Date.now() < until) {} return s; };";
+
+    fn limits(workers: usize, queue: usize, wait_ms: u64) -> Limits {
+        Limits { workers, queue, wait: std::time::Duration::from_millis(wait_ms), ..Limits::default() }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_full_queue_waits_briefly_for_a_slot_then_reports_busy() {
+        let r = Renderer::start_with(bundle("full-queue", SPIN), limits(1, 1, 100), Mirror::new(0, None, &[]), vec![]);
+        let calls: Vec<_> = (0..3)
+            .map(|n| {
+                let r = r.clone();
+                tokio::spawn(async move { r.call("ssrRender", format!("{n}")).await })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let mut results = Vec::new();
+        for c in calls {
+            results.push(c.await.unwrap());
+        }
+        let busy: Vec<_> = results.iter().filter(|r| matches!(r, Err(CallError::Busy))).collect();
+        assert_eq!(busy.len(), 1, "one call is shed");
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 2);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(550));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_call_takes_a_slot_that_frees_within_the_wait() {
+        let r = Renderer::start_with(bundle("wait-queue", SPIN), limits(1, 1, 2000), Mirror::new(0, None, &[]), vec![]);
+        let calls: Vec<_> = (0..3)
+            .map(|n| {
+                let r = r.clone();
+                tokio::spawn(async move { r.call("ssrRender", format!("{n}")).await })
+            })
+            .collect();
+        for c in calls {
+            assert!(c.await.unwrap().is_ok());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_job_whose_caller_gave_up_is_skipped() {
+        let path = bundle("gave-up", "globalThis.n = 0; globalThis.ssrRender = (s) => { const until = Date.now() + 200; while (Date.now() < until) {} globalThis.n++; return String(globalThis.n); };");
+        let r = Renderer::start_with(path, limits(1, 4, 2000), Mirror::new(0, None, &[]), vec![]);
+        let first = {
+            let r = r.clone();
+            tokio::spawn(async move { r.call("ssrRender", "a".into()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let r2 = r.clone();
+        let abandoned = tokio::spawn(async move { r2.call("ssrRender", "b".into()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        abandoned.abort();
+        assert_eq!(first.await.unwrap().unwrap().text, "1");
+        assert_eq!(r.call("ssrRender", "c".into()).await.unwrap().text, "2");
     }
 
     #[tokio::test]

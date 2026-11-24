@@ -1,8 +1,8 @@
-use crate::cache::PageCache;
+use crate::cache::{Outcome, PageCache, Served};
 use crate::config::Config;
 use crate::plugin::Plugin;
 use crate::sitemap::Sitemaps;
-use crate::engine::Renderer;
+use crate::engine::{CallError, Renderer};
 use crate::head::{assemble, assemble_raw, head_tags, Head, Site};
 use crate::mirror::{parse_filter, Mirror};
 use axum::extract::{Request, State};
@@ -19,6 +19,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
 
 const ON_DEMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const RETRY_AFTER_SECS: &str = "5";
 
 pub struct App {
     pub config: Config,
@@ -151,28 +152,29 @@ async fn resolve_misses(app: &App, misses: &[Value]) -> bool {
     !blocking.is_empty() && app.mirror.fetch(blocking, ON_DEMAND_TIMEOUT).await > 0
 }
 
-async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<(String, u16)> {
-    let renderer = app.renderer.as_ref()?;
+async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Outcome {
+    let Some(renderer) = app.renderer.as_ref() else { return Outcome::Failed };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let input = json!({ "url": url, "now": now, "origin": origin }).to_string();
     let mut out = match renderer.call("ssrRender", input.clone()).await {
         Ok(o) => o,
+        Err(CallError::Busy) => return Outcome::Busy,
         Err(e) => {
             tracing::error!("render {url}: {e}");
-            return None;
+            return Outcome::Failed;
         }
     };
     if !out.misses.is_empty() && resolve_misses(app, &out.misses).await {
         match renderer.call("ssrRender", input).await {
             Ok(o) => out = o,
-            Err(e) => tracing::error!("re-render {url}: {e}"),
+            Err(e) => tracing::warn!("re-render {url}: {e}"),
         }
     }
     let rendered: Rendered = match serde_json::from_str(&out.text) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("render output {url}: {e}");
-            return None;
+            return Outcome::Failed;
         }
     };
     let site = Site { name: &app.config.site_name, description: &app.config.description, default_image: &app.config.default_image, origin };
@@ -184,7 +186,7 @@ async fn render(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<
     }
     let raw = rendered.head.raw.is_some() || app.config.opengraph.is_some();
     let page = if raw { assemble_raw(shell_html, &rendered.html, &tags, &rendered.data) } else { assemble(shell_html, &rendered.html, &tags, &rendered.data) };
-    Some((page, rendered.status))
+    Outcome::Page(page, rendered.status)
 }
 
 async fn shell_with_tags(app: &App, origin: &str, shell_html: &str, url: &str) -> Option<String> {
@@ -221,15 +223,18 @@ pub async fn page_for(app: Shared, headers: HeaderMap, url: String) -> Response 
         }
     };
     let cacheable = app.mirror.priority_loaded() && !url.contains('?');
-    let result = if cacheable {
-        app.pages.get_or_render(&format!("{origin}{url}"), produce).await.map(|c| (c.html.as_str().to_string(), c.status))
-    } else {
-        produce().await
-    };
-    match result {
-        Some((body, status)) => html(status, body),
-        None => html(200, plain_shell(&shell_html)),
+    match app.pages.get_or_render(&format!("{origin}{url}"), cacheable, produce).await {
+        Served::Page(c) => html(c.status, c.html.as_str().to_string()),
+        Served::Failed => html(200, plain_shell(&shell_html)),
+        Served::Busy => busy(plain_shell(&shell_html)),
     }
+}
+
+fn busy(body: String) -> Response {
+    let mut res = html(503, body);
+    res.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_SECS));
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
 }
 
 pub async fn warm(app: &Shared, paths: &[String]) {
@@ -451,6 +456,66 @@ globalThis.ssrRender = (json) => {
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
+        for t in busy {
+            t.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_hundred_concurrent_requests_for_one_uncached_url_render_once() {
+        let bundle = "globalThis.n = 0; globalThis.ssrRender = () => { const until = Date.now() + 100; while (Date.now() < until) {} globalThis.n++; return JSON.stringify({ html: '<p>render ' + globalThis.n + '</p>', status: 200, head: {}, data: {} }); };";
+        let app = setup("coalesce", bundle);
+        app.mirror.mark_loaded();
+        let mut tasks = Vec::new();
+        for _ in 0..200 {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move { get_page(&app, "/npub1uncached").await }));
+        }
+        for t in tasks {
+            let (status, body) = t.await.unwrap();
+            assert_eq!(status, 200);
+            assert!(body.contains("<p>render 1</p>"), "{body}");
+        }
+        assert!(get_page(&app, "/other").await.1.contains("<p>render 2</p>"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_page_serves_the_plain_shell_without_rendering_again() {
+        let bundle = "globalThis.n = 0; globalThis.ssrRender = (json) => { globalThis.n++; if (JSON.parse(json).url === '/count') return JSON.stringify({ html: 'n=' + globalThis.n, status: 200 }); return 'not json'; };";
+        let app = setup("negative", bundle);
+        for _ in 0..5 {
+            let (status, body) = get_page(&app, "/broken").await;
+            assert_eq!(status, 200);
+            assert!(body.contains("<div id=\"root\"></div>"));
+        }
+        assert!(get_page(&app, "/count").await.1.contains("n=2"), "the failing page rendered more than once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_saturated_renderer_sheds_uncached_pages_with_503_and_keeps_serving_cached_ones() {
+        let app = setup("shed", SLOW_BUNDLE);
+        let config = app.config.clone();
+        let limits = crate::engine::Limits { workers: 1, queue: 1, wait: Duration::from_millis(50) };
+        let renderer = crate::engine::Renderer::start_with(config.bundle_path(), limits, app.mirror.clone(), vec![]);
+        let app = App::new(config, app.mirror.clone(), Some(renderer));
+        app.mirror.mark_loaded();
+        assert_eq!(get_page(&app, "/cached").await.0, 200);
+        let mut busy = Vec::new();
+        for n in 0..4 {
+            let app = app.clone();
+            busy.push(tokio::spawn(async move { get_page(&app, &format!("/fill{n}")).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let res = router(app.clone()).oneshot(Request::get("/shed").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers()[header::RETRY_AFTER], "5");
+        let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("<div id=\"root\"></div>"));
+        let started = std::time::Instant::now();
+        let (status, body) = get_page(&app, "/cached").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("<p>slow</p>"));
+        assert!(started.elapsed() < Duration::from_millis(50));
         for t in busy {
             t.abort();
         }
